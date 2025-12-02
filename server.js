@@ -22,13 +22,17 @@ console.log('FRESHCHAT_API_KEY:', FRESHCHAT_API_KEY ? '✅ Set' : '❌ Missing')
 console.log('FRESHCHAT_API_URL:', FRESHCHAT_API_URL);
 console.log('OPENAI_API_KEY:', OPENAI_API_KEY ? '✅ Set' : '❌ Missing');
 console.log('ASSISTANT_ID:', ASSISTANT_ID || '❌ Missing');
-console.log('BOT_AGENT_ID:', BOT_AGENT_ID || '⚠️ Not set (optional)');
+console.log('BOT_AGENT_ID:', BOT_AGENT_ID || '⚠️ Not set (REQUIRED for reassignment detection)');
 console.log('HUMAN_AGENT_ID:', HUMAN_AGENT_ID || '⚠️ Not set (for escalation)');
 console.log('='.repeat(70) + '\n');
 
 if (!FRESHCHAT_API_KEY || !OPENAI_API_KEY || !ASSISTANT_ID) {
   console.error('❌ Missing required environment variables!');
   process.exit(1);
+}
+
+if (!BOT_AGENT_ID) {
+  console.warn('⚠️ WARNING: BOT_AGENT_ID not set - reassignment detection will not work!');
 }
 
 const openai = new OpenAI({ 
@@ -43,10 +47,24 @@ const conversationThreads = new Map();
 // Store conversations that have been escalated (bot should NOT respond)
 const escalatedConversations = new Set();
 
+// Store recent webhooks for debugging
+const recentWebhooks = [];
+const MAX_STORED_WEBHOOKS = 50;
+
 function log(emoji, message, data = null) {
   const timestamp = new Date().toISOString();
   console.log(`[${timestamp}] ${emoji} ${message}`);
   if (data) console.log(JSON.stringify(data, null, 2));
+}
+
+function storeWebhook(webhook) {
+  recentWebhooks.unshift({
+    timestamp: new Date().toISOString(),
+    payload: webhook
+  });
+  if (recentWebhooks.length > MAX_STORED_WEBHOOKS) {
+    recentWebhooks.pop();
+  }
 }
 
 function stripCitations(text) {
@@ -99,8 +117,8 @@ function formatForWhatsApp(text) {
   return formatted;
 }
 
-// Check if conversation is assigned to human agent
-async function isConversationWithHuman(conversationId) {
+// Get conversation details from Freshchat API
+async function getConversationDetails(conversationId) {
   try {
     const response = await axios.get(
       `${FRESHCHAT_API_URL}/conversations/${conversationId}`,
@@ -112,8 +130,23 @@ async function isConversationWithHuman(conversationId) {
         timeout: 5000
       }
     );
+    return response.data;
+  } catch (error) {
+    log('❌', 'Error fetching conversation details:', error.message);
+    return null;
+  }
+}
 
-    const conversation = response.data;
+// Check if conversation is assigned to human agent
+async function isConversationWithHuman(conversationId) {
+  try {
+    const conversation = await getConversationDetails(conversationId);
+    
+    if (!conversation) {
+      log('⚠️', 'Could not fetch conversation, assuming bot can respond');
+      return false;
+    }
+
     const assignedAgentId = conversation.assigned_agent_id;
     
     log('🔍', `Conversation ${conversationId} assigned to agent: ${assignedAgentId}`);
@@ -124,6 +157,13 @@ async function isConversationWithHuman(conversationId) {
     if (assignedAgentId && assignedAgentId !== BOT_AGENT_ID) {
       log('👨‍💼', `Conversation is with human agent (${assignedAgentId})`);
       return true;
+    }
+
+    // If conversation is in escalated list but assigned to bot, remove from escalated
+    if (escalatedConversations.has(conversationId) && assignedAgentId === BOT_AGENT_ID) {
+      log('🔄', 'Conversation in escalated list but assigned to bot - removing from escalated');
+      escalatedConversations.delete(conversationId);
+      return false;
     }
 
     // If conversation is in escalated list
@@ -191,7 +231,6 @@ async function escalateToHuman(conversationId) {
 }
 
 // Return conversation back to bot (DE-ESCALATION)
-// NEW: Added sendWelcomeMessage parameter (default true)
 async function returnToBot(conversationId, sendWelcomeMessage = true, reassignInFreshchat = true) {
   try {
     if (!BOT_AGENT_ID) {
@@ -199,42 +238,58 @@ async function returnToBot(conversationId, sendWelcomeMessage = true, reassignIn
       return false;
     }
 
-    log('🔄', `Returning conversation ${conversationId} to bot agent ${BOT_AGENT_ID}`);
+    log('🔄', '═'.repeat(70));
+    log('🔄', `RETURNING conversation ${conversationId} to bot agent ${BOT_AGENT_ID}`);
+    log('🔄', `sendWelcomeMessage: ${sendWelcomeMessage}, reassignInFreshchat: ${reassignInFreshchat}`);
+    log('🔄', '═'.repeat(70));
 
     // Only reassign in Freshchat if needed (skip if already reassigned via UI)
     if (reassignInFreshchat) {
-      const response = await axios.put(
-        `${FRESHCHAT_API_URL}/conversations/${conversationId}`,
-        {
-          assigned_agent_id: BOT_AGENT_ID,
-          status: 'assigned'
-        },
-        {
-          headers: {
-            'Authorization': `Bearer ${FRESHCHAT_API_KEY}`,
-            'Content-Type': 'application/json'
+      try {
+        const response = await axios.put(
+          `${FRESHCHAT_API_URL}/conversations/${conversationId}`,
+          {
+            assigned_agent_id: BOT_AGENT_ID,
+            status: 'assigned'
+          },
+          {
+            headers: {
+              'Authorization': `Bearer ${FRESHCHAT_API_KEY}`,
+              'Content-Type': 'application/json'
+            }
           }
-        }
-      );
+        );
 
-      log('✅', `Conversation reassigned to bot agent via API`);
-      log('📋', 'Response:', response.data);
+        log('✅', `Conversation reassigned to bot agent via API`);
+        log('📋', 'Response:', response.data);
+      } catch (apiError) {
+        log('⚠️', `API reassignment failed (may already be assigned): ${apiError.message}`);
+      }
     } else {
       log('✅', `Conversation already assigned to bot (via Freshchat UI)`);
     }
 
     // Remove from escalated list so bot can respond again
+    const wasEscalated = escalatedConversations.has(conversationId);
     escalatedConversations.delete(conversationId);
-    log('✅', `Removed conversation ${conversationId} from escalated list`);
+    log('✅', `Removed conversation ${conversationId} from escalated list (was escalated: ${wasEscalated})`);
 
     // Send welcome back message if enabled
     if (sendWelcomeMessage) {
-      await sendFreshchatMessage(
-        conversationId,
-        "I'm back! How can I help you today? 😊"
-      );
-      log('📤', `Sent welcome back message to conversation ${conversationId}`);
+      try {
+        await sendFreshchatMessage(
+          conversationId,
+          "I'm back! How can I help you today? 😊"
+        );
+        log('📤', `Sent welcome back message to conversation ${conversationId}`);
+      } catch (msgError) {
+        log('⚠️', `Failed to send welcome message: ${msgError.message}`);
+      }
     }
+
+    log('✅', '═'.repeat(70));
+    log('✅', `Bot is now ACTIVE for conversation ${conversationId}`);
+    log('✅', '═'.repeat(70));
 
     return true;
 
@@ -454,47 +509,106 @@ async function processMessage(conversationId, messageContent) {
   }
 }
 
+// Extract conversation ID from various webhook formats
+function extractConversationId(data) {
+  return data?.conversation?.id ||
+         data?.conversation?.conversation_id ||
+         data?.message?.conversation_id ||
+         data?.assignment?.conversation?.id ||
+         data?.assignment?.conversation_id ||
+         null;
+}
+
+// Extract assigned agent ID from various webhook formats
+function extractAssignedAgentId(data, actor) {
+  return data?.conversation?.assigned_agent_id ||
+         data?.conversation?.assignee?.id ||
+         data?.assignment?.to_agent_id ||
+         data?.assignment?.assignee?.id ||
+         data?.changes?.model_changes?.assigned_agent_id?.[1] || // Freshchat change format [old, new]
+         null;
+}
+
+// Check if this is an assignment-related event
+function isAssignmentEvent(action, data) {
+  const assignmentActions = [
+    'conversation_update',
+    'conversation_assignment',
+    'assignment_update',
+    'agent_assignment',
+    'conversation_reassignment'
+  ];
+  
+  // Check if it's an assignment action OR if assignment data is present
+  const hasAssignmentData = data?.assignment !== undefined ||
+                            data?.conversation?.assigned_agent_id !== undefined ||
+                            data?.changes?.model_changes?.assigned_agent_id !== undefined;
+  
+  return assignmentActions.includes(action) || hasAssignmentData;
+}
+
 // Webhook handler for Freshchat
 app.post('/freshchat-webhook', async (req, res) => {
-  // IMMEDIATELY respond to avoid timeout
   res.status(200).json({ success: true });
+  
+  const webhookBody = req.body;
+  storeWebhook(webhookBody);
   
   log('📥', '═'.repeat(70));
   log('📥', 'WEBHOOK RECEIVED');
   log('📥', '═'.repeat(70));
-  log('📋', 'Full webhook body:', req.body);
+  log('📋', 'Full webhook body:', webhookBody);
   
   try {
-    const { actor, action, data } = req.body;
+    const { actor, action, data } = webhookBody;
     
-    log('📋', 'Extracted:', {
+    const conversationId = extractConversationId(data);
+    const assignedAgentId = extractAssignedAgentId(data, actor);
+    
+    // Also check for changes format (Freshchat sends [old_value, new_value])
+    const changes = data?.changes?.model_changes;
+    const newAssignedAgentId = changes?.assigned_agent_id?.[1] || assignedAgentId;
+    const oldAssignedAgentId = changes?.assigned_agent_id?.[0];
+    
+    log('📋', 'Extracted Info:', {
       action,
       actor_type: actor?.actor_type,
       actor_id: actor?.actor_id,
-      has_data: !!data,
-      has_message: !!data?.message,
-      has_conversation: !!data?.conversation
+      conversationId,
+      assignedAgentId,
+      newAssignedAgentId,
+      oldAssignedAgentId,
+      has_changes: !!changes,
+      escalated_count: escalatedConversations.size,
+      is_in_escalated: conversationId ? escalatedConversations.has(conversationId) : false,
+      bot_agent_id: BOT_AGENT_ID
     });
     
     // =====================================================
-    // FIXED: Handle conversation assignment changes (return to bot)
+    // Handle ALL assignment-related events
     // =====================================================
-    if (action === 'conversation_update' && data?.conversation) {
-      const conversationId = data.conversation.id || data.conversation.conversation_id;
-      const assignedAgentId = data.conversation.assigned_agent_id;
+    if (isAssignmentEvent(action, data) && conversationId) {
+      const effectiveAgentId = newAssignedAgentId || assignedAgentId;
       
-      if (conversationId && assignedAgentId) {
-        log('🔄', `Conversation ${conversationId} assignment changed to: ${assignedAgentId}`);
-        
-        // If conversation was escalated and is now assigned to bot, return to bot
-        if (escalatedConversations.has(conversationId) && assignedAgentId === BOT_AGENT_ID) {
-          log('✅', '═'.repeat(70));
-          log('✅', 'DETECTED: Conversation reassigned to bot via Freshchat UI');
-          log('✅', '═'.repeat(70));
+      log('🔄', '═'.repeat(70));
+      log('🔄', 'ASSIGNMENT EVENT DETECTED');
+      log('🔄', `Action: ${action}`);
+      log('🔄', `Conversation: ${conversationId}`);
+      log('🔄', `Old Agent: ${oldAssignedAgentId || 'unknown'}`);
+      log('🔄', `New Agent: ${effectiveAgentId}`);
+      log('🔄', `Bot Agent ID: ${BOT_AGENT_ID}`);
+      log('🔄', `Is in escalated list: ${escalatedConversations.has(conversationId)}`);
+      log('🔄', '═'.repeat(70));
+      
+      if (effectiveAgentId) {
+        // Check if assigned to bot
+        if (effectiveAgentId === BOT_AGENT_ID) {
+          log('🤖', '═'.repeat(70));
+          log('🤖', 'CONVERSATION ASSIGNED TO BOT!');
+          log('🤖', '═'.repeat(70));
           
-          // Call returnToBot with:
-          // - sendWelcomeMessage = true (send welcome message)
-          // - reassignInFreshchat = false (already assigned via UI, don't call API again)
+          // Always try to return to bot (whether escalated or not)
+          // This handles both escalated and fresh assignments
           returnToBot(conversationId, true, false)
             .then(success => {
               if (success) {
@@ -504,46 +618,44 @@ app.post('/freshchat-webhook', async (req, res) => {
               }
             })
             .catch(err => log('❌', 'Error returning to bot:', err.message));
-        }
-        
-        // NEW: Also handle case where conversation wasn't in escalated list
-        // but is now assigned to bot (e.g., fresh assignment)
-        if (!escalatedConversations.has(conversationId) && assignedAgentId === BOT_AGENT_ID) {
-          log('🤖', `Conversation ${conversationId} assigned to bot (not previously escalated)`);
-          // No need to do anything special, bot will respond to next message
+            
+        } else {
+          log('👤', `Conversation assigned to human agent: ${effectiveAgentId}`);
+          if (!escalatedConversations.has(conversationId)) {
+            log('➕', 'Adding to escalated list (assigned to human)');
+            escalatedConversations.add(conversationId);
+          }
         }
       }
     }
     
     // =====================================================
-    // Handle conversation status changes (reopened chats)
-    // =====================================================
-    if (action === 'conversation_update' && data?.conversation) {
-      const conversationId = data.conversation.id || data.conversation.conversation_id;
-      const status = data.conversation.status;
-      const assignedAgentId = data.conversation.assigned_agent_id;
-      
-      // If conversation is reopened and assigned to bot
-      if (status === 'assigned' && assignedAgentId === BOT_AGENT_ID) {
-        // Make sure it's not in escalated list
-        if (escalatedConversations.has(conversationId)) {
-          log('🔄', `Conversation ${conversationId} reopened and assigned to bot - removing from escalated`);
-          escalatedConversations.delete(conversationId);
-        }
-      }
-    }
-    
     // Handle manager messages with resolution keywords
+    // =====================================================
     if (action === 'message_create' && actor?.actor_type === 'agent') {
-      const conversationId = data?.message?.conversation_id;
+      const messageConversationId = data?.message?.conversation_id;
       const messageContent = data?.message?.message_parts?.[0]?.text?.content;
       const agentId = actor?.actor_id;
       
-      if (conversationId && messageContent && agentId && agentId !== BOT_AGENT_ID) {
-        if (escalatedConversations.has(conversationId)) {
+      log('💬', 'Agent message detected:', {
+        conversationId: messageConversationId,
+        agentId,
+        isBotAgent: agentId === BOT_AGENT_ID,
+        isEscalated: escalatedConversations.has(messageConversationId),
+        messagePreview: messageContent?.substring(0, 50)
+      });
+      
+      if (messageConversationId && messageContent && agentId && agentId !== BOT_AGENT_ID) {
+        if (escalatedConversations.has(messageConversationId)) {
           const resolutionKeywords = [
-            'it seems like you are unavailable at the moment. I am closing the chat for now',
-            'Looks like you\'re away at the moment, so I\'ll close this chat for now. You can reopen it anytime to continue with assistance.',
+            'it seems like you are unavailable at the moment',
+            'i am closing the chat for now',
+            'looks like you\'re away at the moment',
+            'i\'ll close this chat for now',
+            'closing this conversation',
+            'returning to bot',
+            'handing back to bot',
+            'transferring back'
           ];
           
           const messageLower = messageContent.toLowerCase();
@@ -552,39 +664,41 @@ app.post('/freshchat-webhook', async (req, res) => {
           );
           
           if (hasResolutionKeyword) {
-            log('✅', `Manager indicated resolution - returning conversation ${conversationId} to bot`);
-            returnToBot(conversationId, true, true)
+            log('✅', '═'.repeat(70));
+            log('✅', 'RESOLUTION KEYWORD DETECTED');
+            log('✅', `Returning conversation ${messageConversationId} to bot`);
+            log('✅', '═'.repeat(70));
+            
+            returnToBot(messageConversationId, true, true)
               .catch(err => log('❌', 'Failed to return to bot:', err.message));
           }
         }
       }
     }
     
-    // Handle user messages (message_create event from users)
+    // =====================================================
+    // Handle user messages
+    // =====================================================
     if (action === 'message_create' && actor?.actor_type === 'user') {
-      
-      const conversationId = data?.message?.conversation_id;
+      const messageConversationId = data?.message?.conversation_id;
       const messageContent = data?.message?.message_parts?.[0]?.text?.content;
       
-      log('🔍', 'Message data:', {
-        conversationId,
+      log('🔍', 'User message data:', {
+        conversationId: messageConversationId,
         messageContent: messageContent?.substring(0, 100),
-        has_both: !!(conversationId && messageContent)
+        isEscalated: escalatedConversations.has(messageConversationId)
       });
       
-      if (!conversationId || !messageContent) {
+      if (!messageConversationId || !messageContent) {
         log('⚠️', 'Missing conversation ID or message content');
         return;
       }
 
-      log('💬', `Processing user message: "${messageContent}"`);
-      log('📍', `Conversation ID: ${conversationId}`);
-
-      processMessage(conversationId, messageContent)
+      processMessage(messageConversationId, messageContent)
         .catch(err => log('❌', 'Async processing error:', err.message));
       
-    } else if (action !== 'conversation_update' && action !== 'message_create') {
-      log('ℹ️', `Ignoring webhook: action=${action}, actor_type=${actor?.actor_type}`);
+    } else if (!isAssignmentEvent(action, data) && action !== 'message_create') {
+      log('ℹ️', `Ignoring webhook: action=${action}`);
     }
     
   } catch (error) {
@@ -593,33 +707,78 @@ app.post('/freshchat-webhook', async (req, res) => {
   }
 });
 
-// Manual test endpoint
+// Debug endpoint to view recent webhooks
+app.get('/debug/webhooks', (req, res) => {
+  res.json({
+    count: recentWebhooks.length,
+    max_stored: MAX_STORED_WEBHOOKS,
+    webhooks: recentWebhooks
+  });
+});
+
+// Debug endpoint to view state
+app.get('/debug/state', (req, res) => {
+  res.json({
+    escalated_conversations: Array.from(escalatedConversations),
+    escalated_count: escalatedConversations.size,
+    active_threads: Array.from(conversationThreads.entries()).map(([k, v]) => ({ conversation: k, thread: v })),
+    thread_count: conversationThreads.size,
+    bot_agent_id: BOT_AGENT_ID,
+    human_agent_id: HUMAN_AGENT_ID
+  });
+});
+
+// Manual force return to bot
+app.post('/force-return-to-bot/:conversationId', async (req, res) => {
+  const { conversationId } = req.params;
+  
+  log('🔧', `FORCE RETURN TO BOT: ${conversationId}`);
+  
+  try {
+    escalatedConversations.delete(conversationId);
+    
+    if (BOT_AGENT_ID) {
+      try {
+        await axios.put(
+          `${FRESHCHAT_API_URL}/conversations/${conversationId}`,
+          { assigned_agent_id: BOT_AGENT_ID, status: 'assigned' },
+          { headers: { 'Authorization': `Bearer ${FRESHCHAT_API_KEY}`, 'Content-Type': 'application/json' } }
+        );
+      } catch (apiErr) {
+        log('⚠️', `API reassignment failed: ${apiErr.message}`);
+      }
+    }
+    
+    try {
+      await sendFreshchatMessage(conversationId, "I'm back! How can I help you today? 😊");
+    } catch (msgErr) {
+      log('⚠️', `Failed to send message: ${msgErr.message}`);
+    }
+    
+    res.json({ success: true, message: 'Force returned to bot', conversation_id: conversationId });
+    
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Other endpoints
 app.post('/test-message', async (req, res) => {
   const { conversation_id, message } = req.body;
   
   if (!conversation_id || !message) {
-    return res.status(400).json({
-      error: 'Missing parameters',
-      required: { conversation_id: 'string', message: 'string' }
-    });
+    return res.status(400).json({ error: 'Missing parameters' });
   }
 
   try {
-    log('🧪', `Manual test: conversation=${conversation_id}`);
-    
     const isWithHuman = await isConversationWithHuman(conversation_id);
     
     if (isWithHuman) {
-      return res.json({
-        success: false,
-        message: 'Conversation is with human agent - bot will not respond',
-        conversation_id
-      });
+      return res.json({ success: false, message: 'Conversation is with human agent', conversation_id });
     }
 
     let threadId = conversationThreads.get(conversation_id);
-    const { response, threadId: newThreadId, needsEscalation } = 
-      await getAssistantResponse(message, threadId);
+    const { response, threadId: newThreadId, needsEscalation } = await getAssistantResponse(message, threadId);
     
     conversationThreads.set(conversation_id, newThreadId);
     
@@ -630,72 +789,32 @@ app.post('/test-message', async (req, res) => {
       await escalateToHuman(conversation_id);
     }
     
-    res.json({
-      success: true,
-      conversation_id,
-      response: response.substring(0, 200) + '...',
-      thread_id: newThreadId,
-      escalated: needsEscalation
-    });
+    res.json({ success: true, conversation_id, response: response.substring(0, 200) + '...', escalated: needsEscalation });
     
   } catch (error) {
-    log('❌', 'Test failed:', error.message);
-    res.status(500).json({
-      error: error.message,
-      conversation_id
-    });
+    res.status(500).json({ error: error.message });
   }
 });
 
-// Reset escalation (for testing)
 app.post('/reset-escalation/:conversationId', (req, res) => {
   const { conversationId } = req.params;
-  
   escalatedConversations.delete(conversationId);
   conversationThreads.delete(conversationId);
-  
-  log('🔄', `Reset escalation for conversation: ${conversationId}`);
-  
-  res.json({
-    success: true,
-    message: 'Escalation reset - bot can respond again',
-    conversation_id: conversationId
-  });
+  res.json({ success: true, message: 'Escalation reset' });
 });
 
-// Manually return conversation to bot
 app.post('/return-to-bot/:conversationId', async (req, res) => {
   const { conversationId } = req.params;
-  const { send_message = true } = req.query; // Optional query param
+  const sendMessage = req.query.send_message !== 'false';
   
   try {
-    const success = await returnToBot(conversationId, send_message === 'true' || send_message === true, true);
-    
-    if (success) {
-      res.json({
-        success: true,
-        message: 'Conversation returned to bot',
-        conversation_id: conversationId,
-        welcome_message_sent: send_message
-      });
-    } else {
-      res.status(500).json({
-        success: false,
-        message: 'Failed to return conversation to bot',
-        conversation_id: conversationId
-      });
-    }
+    const success = await returnToBot(conversationId, sendMessage, true);
+    res.json({ success, conversation_id: conversationId });
   } catch (error) {
-    log('❌', 'Error returning to bot:', error.message);
-    res.status(500).json({
-      success: false,
-      error: error.message,
-      conversation_id: conversationId
-    });
+    res.status(500).json({ success: false, error: error.message });
   }
 });
 
-// View escalated conversations
 app.get('/escalated', (req, res) => {
   res.json({
     escalated_conversations: Array.from(escalatedConversations),
@@ -704,19 +823,15 @@ app.get('/escalated', (req, res) => {
   });
 });
 
-// Health check
 app.get('/health', (req, res) => {
   res.json({ 
     status: 'healthy',
-    version: '8.0.0',
+    version: '9.0.0',
     timestamp: new Date().toISOString(),
     config: {
       freshchat_api_url: FRESHCHAT_API_URL,
-      has_api_key: !!FRESHCHAT_API_KEY,
-      has_openai_key: !!OPENAI_API_KEY,
-      has_assistant_id: !!ASSISTANT_ID,
       has_bot_agent_id: !!BOT_AGENT_ID,
-      has_human_agent_id: !!HUMAN_AGENT_ID
+      bot_agent_id: BOT_AGENT_ID || 'NOT SET'
     },
     stats: {
       activeThreads: conversationThreads.size,
@@ -725,7 +840,6 @@ app.get('/health', (req, res) => {
   });
 });
 
-// Configuration test
 app.get('/test-config', async (req, res) => {
   const results = {
     timestamp: new Date().toISOString(),
@@ -748,47 +862,45 @@ app.get('/test-config', async (req, res) => {
   }
 
   try {
-    const response = await axios.get(
-      `${FRESHCHAT_API_URL}/accounts/configuration`,
-      {
-        headers: {
-          'Authorization': `Bearer ${FRESHCHAT_API_KEY}`,
-          'Content-Type': 'application/json'
-        },
-        timeout: 5000
-      }
-    );
+    await axios.get(`${FRESHCHAT_API_URL}/agents`, {
+      headers: { 'Authorization': `Bearer ${FRESHCHAT_API_KEY}` },
+      timeout: 5000
+    });
     results.tests.freshchat = '✅ Connected';
   } catch (error) {
-    results.tests.freshchat = `❌ Failed: ${error.response?.status} - ${error.message}`;
+    results.tests.freshchat = `❌ Failed: ${error.response?.status}`;
   }
 
   res.json(results);
 });
 
-// Root endpoint
+app.get('/list-agents', async (req, res) => {
+  try {
+    const response = await axios.get(`${FRESHCHAT_API_URL}/agents`, {
+      headers: { 'Authorization': `Bearer ${FRESHCHAT_API_KEY}` },
+      timeout: 10000
+    });
+    res.json({ success: true, agents: response.data.agents || response.data });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 app.get('/', (req, res) => {
   res.json({
     name: 'Freshchat-OpenAI Integration',
-    version: '8.0.0',
+    version: '9.0.0',
     status: 'running',
+    important: {
+      bot_agent_id: BOT_AGENT_ID || '⚠️ NOT SET - Use /list-agents to find it!'
+    },
     endpoints: {
       webhook: 'POST /freshchat-webhook',
-      test_message: 'POST /test-message (body: {conversation_id, message})',
-      reset_escalation: 'POST /reset-escalation/:conversationId',
-      return_to_bot: 'POST /return-to-bot/:conversationId?send_message=true',
-      escalated: 'GET /escalated',
-      health: 'GET /health',
-      test_config: 'GET /test-config'
-    },
-    features: {
-      auto_escalation: 'Bot escalates to human when needed',
-      auto_return: 'Conversation returns to bot when reassigned via Freshchat UI',
-      resolution_keywords: 'Detects manager messages with resolution keywords',
-      whatsapp_formatting: 'Messages formatted for WhatsApp display',
-      welcome_message: 'Bot sends welcome message when returning from human agent'
-    },
-    docs: 'Send POST to /test-message to manually test'
+      force_return: 'POST /force-return-to-bot/:conversationId',
+      debug_webhooks: 'GET /debug/webhooks',
+      debug_state: 'GET /debug/state',
+      list_agents: 'GET /list-agents'
+    }
   });
 });
 
@@ -796,17 +908,15 @@ const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
   console.log('\n' + '='.repeat(70));
-  console.log('🚀 Freshchat-OpenAI Integration Server Started');
+  console.log('🚀 Freshchat-OpenAI Integration v9.0.0');
   console.log('='.repeat(70));
   console.log(`📍 Port: ${PORT}`);
-  console.log(`🔗 Webhook: POST /freshchat-webhook`);
-  console.log(`🧪 Test: POST /test-message`);
-  console.log(`🔄 Reset: POST /reset-escalation/:conversationId`);
-  console.log(`↩️  Return to Bot: POST /return-to-bot/:conversationId`);
-  console.log(`📊 Escalated: GET /escalated`);
-  console.log(`❤️  Health: GET /health`);
-  console.log(`🔧 Config: GET /test-config`);
+  console.log(`🤖 Bot Agent ID: ${BOT_AGENT_ID || '⚠️ NOT SET'}`);
+  console.log(`👤 Human Agent ID: ${HUMAN_AGENT_ID || '⚠️ NOT SET'}`);
   console.log('='.repeat(70));
-  console.log('✨ Features: Auto-escalation & Auto-return to bot (with welcome message)');
+  console.log('📌 Debug endpoints:');
+  console.log('   GET /debug/webhooks - View recent webhooks');
+  console.log('   GET /debug/state - View escalation state');
+  console.log('   GET /list-agents - Find agent IDs');
   console.log('='.repeat(70) + '\n');
 });
