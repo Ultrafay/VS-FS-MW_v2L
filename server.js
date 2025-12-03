@@ -100,14 +100,29 @@ function formatForWhatsApp(text) {
 
   let formatted = text.trim();
 
+  // ✅ ADD THIS: Convert Markdown links [text](url) to just the URL
+  formatted = formatted.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '$2');
+
+  // Remove bold
   formatted = formatted.replace(/\*\*(.*?)\*\*/g, '$1');
   formatted = formatted.replace(/\*(.*?)\*/g, '$1');
+  
+  // Remove underline/italic
   formatted = formatted.replace(/__(.*?)__/g, '$1');
   formatted = formatted.replace(/_(.*?)_/g, '$1');
+  
+  // Remove inline code
   formatted = formatted.replace(/`([^`]+)`/g, '$1');
+  
+  // Convert headers to uppercase
   formatted = formatted.replace(/^#+\s*(.*)$/gm, (_, title) => title.toUpperCase());
+  
+  // Normalize bullets
   formatted = formatted.replace(/^[\u2022•▪◦]\s*/gm, '- ');
+  
+  // Clean up extra newlines
   formatted = formatted.replace(/\n{3,}/g, '\n\n');
+  
   formatted = formatted
     .split('\n')
     .map(line => line.trimEnd())
