@@ -225,11 +225,6 @@ async function escalateToHuman(conversationId) {
 
     escalatedConversations.add(conversationId);
 
-    await sendFreshchatMessage(
-      conversationId,
-      "I'm connecting you with my manager who will be with you shortly. 👋"
-    );
-
     conversationThreads.delete(conversationId);
     log('🗑️', `Removed thread for conversation ${conversationId}`);
 
