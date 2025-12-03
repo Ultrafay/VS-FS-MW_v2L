@@ -212,7 +212,7 @@ async function escalateToHuman(conversationId) {
 
     await sendFreshchatMessage(
       conversationId,
-      "I'm connecting you with a team member who will be with you shortly. 👋"
+      "I'm connecting you with my manager who will be with you shortly. 👋"
     );
 
     conversationThreads.delete(conversationId);
@@ -409,8 +409,8 @@ async function getAssistantResponse(userMessage, threadId = null) {
     log('🤖', `Assistant said: ${responseText.substring(0, 200)}...`);
 
     const escalationKeywords = [
-      'connect you with my manager',
-      'connect you with a manager',
+      'Please allow me to connect you to our manager. The response may take 12 to 24 hours due to the high volume of chats. Your patience would be highly appreciated.',
+      'connecting you with a manager',
       'speak to my manager',
       'talk to my manager',
       'escalate',
