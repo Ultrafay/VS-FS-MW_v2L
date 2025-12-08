@@ -425,7 +425,8 @@ async function getAssistantResponse(userMessage, threadId = null) {
       'talk to my manager',
       'escalate',
       'human agent',
-      'real person'
+      'real person',
+      'allow me to connect with my manager'
     ];
 
     const needsEscalation = escalationKeywords.some(keyword => 
