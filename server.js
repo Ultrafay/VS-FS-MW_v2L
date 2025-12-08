@@ -420,13 +420,13 @@ async function getAssistantResponse(userMessage, threadId = null) {
 
     const escalationKeywords = [
       'Please allow me to connect you to our manager. The response may take 12 to 24 hours due to the high volume of chats. Your patience would be highly appreciated.',
-      'connecting you with a manager',
-      'speak to my manager',
-      'talk to my manager',
+      'connecting you with a Human Representative',
+      'speak to my Human Representative',
+      'talk to my Human Representative',
       'escalate',
       'human agent',
       'real person',
-      'allow me to connect with my manager'
+      'allow me to connect with Human Representative'
     ];
 
     const needsEscalation = escalationKeywords.some(keyword => 
