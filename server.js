@@ -67,6 +67,9 @@ function storeWebhook(webhook) {
   }
 }
 
+// ============================================================
+// IMPROVED: Strip all citation formats from OpenAI responses
+// ============================================================
 function stripCitations(text) {
   if (!text || typeof text !== 'string') {
     return text;
@@ -75,24 +78,57 @@ function stripCitations(text) {
   let cleaned = text;
 
   const inlinePatterns = [
+    // Standard footnote patterns
     /\[\^\d+\^\]/g,
     /\[\d+\]/g,
-    /【\d+(?::\d+)?(?:†[^】]*)?】/g,
-    /\(Source:[^)]+\)/gi
+    
+    // OpenAI Assistant citation patterns - IMPROVED to catch ALL formats
+    // Catches: 【12:0,1,2†Advanced Financial Management AFM】
+    // Catches: 【4:0†source】
+    // Catches: 【1:2:3†anything】
+    /【[^】]*】/g,
+    
+    // Source patterns
+    /\(Source:[^)]+\)/gi,
+    /\[Source:[^\]]+\]/gi,
+    
+    // Additional OpenAI patterns
+    /\[\d+:\d+[^\]]*\]/g,
+    /\(\d+:\d+[^)]*\)/g,
+    
+    // Superscript-style citations
+    /\^\[\d+\]/g,
+    /\[\^\d+\]/g,
+    
+    // Catch any remaining bracket citations with numbers/colons
+    /\[\d+[:\d,†]*[^\]]*\]/g
   ];
 
   inlinePatterns.forEach(pattern => {
     cleaned = cleaned.replace(pattern, '');
   });
 
+  // Remove citation lines at start of line
   cleaned = cleaned.replace(/^\s*\[\^\d+\^\]:.*$/gm, '');
-  cleaned = cleaned.replace(/^\s*【\d+(?::\d+)?(?:†[^】]*)?】.*$/gm, '');
+  cleaned = cleaned.replace(/^\s*【[^】]*】.*$/gm, '');
+  
+  // Clean up extra spaces left behind
   cleaned = cleaned.replace(/[ \t]{2,}/g, ' ');
-  cleaned = cleaned.replace(/\s+\n/g, '\n').trim();
-
-  return cleaned;
+  cleaned = cleaned.replace(/\s+\n/g, '\n');
+  
+  // Clean up multiple periods or spaces before periods
+  cleaned = cleaned.replace(/\s+\./g, '.');
+  cleaned = cleaned.replace(/\.{2,}/g, '.');
+  
+  // Clean up space before punctuation
+  cleaned = cleaned.replace(/\s+([,;:!?])/g, '$1');
+  
+  return cleaned.trim();
 }
 
+// ============================================================
+// IMPROVED: Format response for WhatsApp with better spacing
+// ============================================================
 function formatForWhatsApp(text) {
   if (!text || typeof text !== 'string') {
     return text;
@@ -100,7 +136,7 @@ function formatForWhatsApp(text) {
 
   let formatted = text.trim();
 
-  // ✅ ADD THIS: Convert Markdown links [text](url) to just the URL
+  // Convert Markdown links [text](url) to just the URL
   formatted = formatted.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '$2');
 
   // Remove bold
@@ -117,12 +153,47 @@ function formatForWhatsApp(text) {
   // Convert headers to uppercase
   formatted = formatted.replace(/^#+\s*(.*)$/gm, (_, title) => title.toUpperCase());
   
-  // Normalize bullets
-  formatted = formatted.replace(/^[\u2022•▪◦]\s*/gm, '- ');
+  // Normalize bullets to simple bullet point
+  formatted = formatted.replace(/^[\u2022•▪◦-]\s*/gm, '• ');
   
-  // Clean up extra newlines
+  // ============================================================
+  // SPACING FIXES
+  // ============================================================
+  
+  // 1. Add blank line BEFORE bullet list (if text before it)
+  formatted = formatted.replace(/([^\n•])\n(•\s)/g, '$1\n\n$2');
+  
+  // 2. Keep bullets together (no extra spacing between consecutive bullets)
+  formatted = formatted.replace(/(•\s[^\n]+)\n\n+(•\s)/g, '$1\n$2');
+  
+  // 3. Add blank line AFTER bullet list (before next paragraph)
+  formatted = formatted.replace(/(•\s[^\n]+)\n([^•\n\s])/g, '$1\n\n$2');
+  
+  // 4. Add blank line before common question phrases
+  formatted = formatted.replace(/([^\n])\n(Would you like)/g, '$1\n\n$2');
+  formatted = formatted.replace(/([^\n])\n(Do you want)/g, '$1\n\n$2');
+  formatted = formatted.replace(/([^\n])\n(Do you need)/g, '$1\n\n$2');
+  formatted = formatted.replace(/([^\n])\n(Would you prefer)/g, '$1\n\n$2');
+  formatted = formatted.replace(/([^\n])\n(May I know)/g, '$1\n\n$2');
+  formatted = formatted.replace(/([^\n])\n(Please let me know)/g, '$1\n\n$2');
+  
+  // 5. Add blank line before closing/escalation statements
+  formatted = formatted.replace(/([^\n])\n(I have tried my best)/g, '$1\n\n$2');
+  formatted = formatted.replace(/([^\n])\n(If you want me to continue)/g, '$1\n\n$2');
+  formatted = formatted.replace(/([^\n])\n(If you want me to assist)/g, '$1\n\n$2');
+  formatted = formatted.replace(/([^\n])\n(If you require further)/g, '$1\n\n$2');
+  formatted = formatted.replace(/([^\n])\n(Please reply with)/g, '$1\n\n$2');
+  
+  // 6. Add blank line after greeting (if followed by content)
+  formatted = formatted.replace(/(Hello!?|Hi!?|Good morning!?|Good afternoon!?|Good evening!?)\s*\n([^\n])/gi, '$1\n\n$2');
+  
+  // 7. Add blank line before "For" statements that start fee/course info
+  formatted = formatted.replace(/([^\n])\n(For [A-Z]{2,3} )/g, '$1\n\n$2');
+  
+  // Clean up excessive newlines (max 2 consecutive)
   formatted = formatted.replace(/\n{3,}/g, '\n\n');
   
+  // Trim each line and rejoin
   formatted = formatted
     .split('\n')
     .map(line => line.trimEnd())
@@ -839,7 +910,7 @@ app.get('/escalated', (req, res) => {
 app.get('/health', (req, res) => {
   res.json({ 
     status: 'healthy',
-    version: '9.0.0',
+    version: '9.1.0',
     timestamp: new Date().toISOString(),
     config: {
       freshchat_api_url: FRESHCHAT_API_URL,
@@ -902,7 +973,7 @@ app.get('/list-agents', async (req, res) => {
 app.get('/', (req, res) => {
   res.json({
     name: 'Freshchat-OpenAI Integration',
-    version: '9.0.0',
+    version: '9.1.0',
     status: 'running',
     important: {
       bot_agent_id: BOT_AGENT_ID || '⚠️ NOT SET - Use /list-agents to find it!'
@@ -921,7 +992,7 @@ const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
   console.log('\n' + '='.repeat(70));
-  console.log('🚀 Freshchat-OpenAI Integration v9.0.0');
+  console.log('🚀 Freshchat-OpenAI Integration v9.1.0');
   console.log('='.repeat(70));
   console.log(`📍 Port: ${PORT}`);
   console.log(`🤖 Bot Agent ID: ${BOT_AGENT_ID || '⚠️ NOT SET'}`);
