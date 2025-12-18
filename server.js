@@ -51,119 +51,6 @@ const escalatedConversations = new Set();
 const recentWebhooks = [];
 const MAX_STORED_WEBHOOKS = 50;
 
-// ============================================================
-// PROFESSIONAL ERROR HANDLING & MESSAGE QUEUE SYSTEM (v11.0.0)
-// ============================================================
-
-class ProcessingState {
-  constructor(conversationId) {
-    this.conversationId = conversationId;
-    this.locked = false;
-    this.queue = [];
-    this.currentMessage = null;
-    this.startTime = null;
-    this.maxQueueSize = 3;
-    this.maxProcessingTime = 30000; // 30 seconds timeout
-    this.createdAt = Date.now();
-  }
-  
-  lock() {
-    this.locked = true;
-    this.startTime = Date.now();
-    log('🔒', `Conversation ${this.conversationId} LOCKED for processing`);
-  }
-  
-  unlock() {
-    const processingDuration = this.startTime ? Date.now() - this.startTime : 0;
-    log('🔓', `Conversation ${this.conversationId} UNLOCKED (took ${processingDuration}ms)`);
-    this.locked = false;
-    this.startTime = null;
-    this.currentMessage = null;
-  }
-  
-  isLocked() {
-    return this.locked;
-  }
-  
-  isProcessingTimeout() {
-    if (!this.locked) return false;
-    return (Date.now() - this.startTime) > this.maxProcessingTime;
-  }
-  
-  addToQueue(message) {
-    if (this.queue.length >= this.maxQueueSize) {
-      return { success: false, reason: 'QUEUE_FULL' };
-    }
-    this.queue.push({
-      content: message,
-      timestamp: Date.now()
-    });
-    log('📋', `Message queued for ${this.conversationId}. Queue size: ${this.queue.length}`);
-    return { success: true, queueLength: this.queue.length };
-  }
-  
-  getNextFromQueue() {
-    return this.queue.shift();
-  }
-  
-  hasQueuedMessages() {
-    return this.queue.length > 0;
-  }
-  
-  getQueueSize() {
-    return this.queue.length;
-  }
-  
-  getState() {
-    return {
-      conversationId: this.conversationId,
-      locked: this.locked,
-      queueSize: this.queue.length,
-      isTimeout: this.isProcessingTimeout(),
-      processingTime: this.locked ? Date.now() - this.startTime : null,
-      createdAt: this.createdAt
-    };
-  }
-}
-
-// Store processing states
-const conversationLocks = new Map();
-
-function getOrCreateState(conversationId) {
-  if (!conversationLocks.has(conversationId)) {
-    conversationLocks.set(conversationId, new ProcessingState(conversationId));
-  }
-  return conversationLocks.get(conversationId);
-}
-
-async function acquireLock(conversationId) {
-  const state = getOrCreateState(conversationId);
-  
-  // Check if lock is stuck (timeout)
-  if (state.isLocked() && state.isProcessingTimeout()) {
-    log('⚠️', `Processing timeout detected for ${conversationId}. Force releasing lock.`);
-    state.unlock();
-    return false;
-  }
-  
-  if (state.isLocked()) {
-    return false; // Lock already held by another message
-  }
-  
-  state.lock();
-  return true; // Lock acquired successfully
-}
-
-function releaseLock(conversationId) {
-  const state = getOrCreateState(conversationId);
-  state.unlock();
-}
-
-function getConversationState(conversationId) {
-  const state = getOrCreateState(conversationId);
-  return state.getState();
-}
-
 function log(emoji, message, data = null) {
   const timestamp = new Date().toISOString();
   console.log(`[${timestamp}] ${emoji} ${message}`);
@@ -195,7 +82,10 @@ function stripCitations(text) {
     /\[\^\d+\^\]/g,
     /\[\d+\]/g,
     
-    // OpenAI Assistant citation patterns
+    // OpenAI Assistant citation patterns - IMPROVED to catch ALL formats
+    // Catches: 【12:0,1,2†Advanced Financial Management AFM】
+    // Catches: 【4:0†source】
+    // Catches: 【1:2:3†anything】
     /【[^】]*】/g,
     
     // Source patterns
@@ -402,6 +292,7 @@ async function escalateToHuman(conversationId) {
     );
 
     log('✅', `Conversation reassigned to human agent`);
+    log('📋', 'Response:', response.data);
 
     escalatedConversations.add(conversationId);
 
@@ -451,6 +342,7 @@ async function returnToBot(conversationId, sendWelcomeMessage = true, reassignIn
         );
 
         log('✅', `Conversation reassigned to bot agent via API`);
+        log('📋', 'Response:', response.data);
       } catch (apiError) {
         log('⚠️', `API reassignment failed (may already be assigned): ${apiError.message}`);
       }
@@ -597,11 +489,8 @@ async function getAssistantResponse(userMessage, threadId = null) {
     const responseText = assistantMessage.content[0].text.value;
     log('🤖', `Assistant said: ${responseText.substring(0, 200)}...`);
 
-    // ============================================================
-    // Check for escalation keyword in response
-    // ============================================================
     const escalationKeywords = [
-      'Please allow me to connect you to our manager',
+      'Please allow me to connect you to our manager. The response may take 12 to 24 hours due to the high volume of chats. Your patience would be highly appreciated.',
       'connecting you with a Human Representative',
       'speak to my Human Representative',
       'talk to my Human Representative',
@@ -634,154 +523,49 @@ async function getAssistantResponse(userMessage, threadId = null) {
   }
 }
 
-// ============================================================
-// PROFESSIONAL MESSAGE HANDLING WITH QUEUE (v11.0.0)
-// ============================================================
-async function handleUserMessage(conversationId, messageContent) {
-  const state = getOrCreateState(conversationId);
-  
-  log('📥', '═'.repeat(70));
-  log('📥', `NEW MESSAGE for conversation: ${conversationId}`);
-  log('📥', `Current state: locked=${state.isLocked()}, queueSize=${state.getQueueSize()}`);
-  log('📥', '═'.repeat(70));
-  
-  // Try to acquire lock
-  if (!state.isLocked()) {
-    // ================================================
-    // LOCK ACQUIRED - Process immediately
-    // ================================================
-    log('✅', `Lock acquired for ${conversationId} - processing immediately`);
-    
-    state.lock();
-    try {
-      await processMessageNow(conversationId, messageContent);
-    } catch (error) {
-      log('❌', `Error during processing: ${error.message}`);
-    } finally {
-      state.unlock();
-      
-      // ================================================
-      // Check if we have queued messages
-      // ================================================
-      if (state.hasQueuedMessages()) {
-        const nextMsg = state.getNextFromQueue();
-        log('📋', `Processing next queued message for ${conversationId}`);
-        
-        // Process next message asynchronously (avoid blocking)
-        setImmediate(() => handleUserMessage(conversationId, nextMsg.content));
-      }
-    }
-  } else {
-    // ================================================
-    // LOCK HELD - Queue this message
-    // ================================================
-    log('⏳', `Lock held for ${conversationId} - attempting to queue message`);
-    
-    const result = state.addToQueue(messageContent);
-    
-    if (!result.success && result.reason === 'QUEUE_FULL') {
-      // ================================================
-      // QUEUE FULL - ESCALATE TO HUMAN
-      // ================================================
-      log('🚨', '═'.repeat(70));
-      log('🚨', `QUEUE FULL for conversation ${conversationId}`);
-      log('🚨', `${state.getQueueSize()} messages already waiting`);
-      log('🚨', 'Escalating to human agent');
-      log('🚨', '═'.repeat(70));
-      
-      try {
-        await sendFreshchatMessage(
-          conversationId,
-          "I can see you have multiple urgent questions. " +
-          "Let me connect you with our support team who can help you better. " +
-          "They'll address all your concerns immediately. Thank you for your patience! 👋"
-        );
-        await escalateToHuman(conversationId);
-      } catch (error) {
-        log('❌', `Failed to escalate: ${error.message}`);
-      }
-    } else {
-      // ================================================
-      // MESSAGE QUEUED - Send status update
-      // ================================================
-      log('📋', `Message queued successfully. Queue length: ${result.queueLength}`);
-      
-      // Only send status for first queued message, not every message
-      if (result.queueLength === 1) {
-        try {
-          await sendFreshchatMessage(
-            conversationId,
-            "⏳ I'm still thinking about your first message. " +
-            "I'll answer all your questions in order. Thank you for your patience!"
-          );
-        } catch (error) {
-          log('⚠️', `Failed to send status update: ${error.message}`);
-        }
-      }
-    }
-  }
-}
-
-// ============================================================
-// ACTUAL MESSAGE PROCESSING
-// ============================================================
-async function processMessageNow(conversationId, messageContent) {
+// Process message asynchronously
+async function processMessage(conversationId, messageContent) {
   try {
     log('🔄', '═'.repeat(70));
     log('🔄', `Processing conversation: ${conversationId}`);
     log('💬', `User message: "${messageContent}"`);
 
-    // ================================================
-    // CRITICAL CHECK: Is conversation with human?
-    // ================================================
     const isWithHuman = await isConversationWithHuman(conversationId);
     
     if (isWithHuman) {
-      log('🛑', 'Conversation is with human - stopping');
+      log('🛑', '═'.repeat(70));
+      log('🛑', 'STOPPING: Conversation is with human agent');
+      log('🛑', 'Bot will NOT respond');
+      log('🛑', '═'.repeat(70));
       return;
     }
 
-    log('✅', 'Conversation is with bot - proceeding');
+    log('🤖', 'Conversation is with bot - proceeding with AI response');
+    log('🔄', '═'.repeat(70));
 
-    // ================================================
-    // GET RESPONSE FROM OPENAI WITH TIMEOUT
-    // ================================================
     let threadId = conversationThreads.get(conversationId);
-    
-    // Create timeout promise
-    const timeoutPromise = new Promise((_, reject) => 
-      setTimeout(
-        () => reject(new Error('OpenAI processing timeout (>30s)')), 
-        30000
-      )
-    );
-    
-    // Race: OpenAI response vs timeout
+
     const { response, threadId: newThreadId, needsEscalation } = 
-      await Promise.race([
-        getAssistantResponse(messageContent, threadId),
-        timeoutPromise
-      ]);
+      await getAssistantResponse(messageContent, threadId);
 
     conversationThreads.set(conversationId, newThreadId);
-    log('💾', `Saved thread ${newThreadId}`);
+    log('💾', `Saved thread ${newThreadId} for conversation ${conversationId}`);
 
-    // ================================================
-    // DECISION: Escalate or respond?
-    // ================================================
+    const cleanedResponse = formatForWhatsApp(stripCitations(response));
+    await sendFreshchatMessage(conversationId, cleanedResponse);
+
     if (needsEscalation) {
-      log('🚨', 'Escalation needed - sending message and escalating');
+      log('🚨', '═'.repeat(70));
+      log('🚨', 'ESCALATION TRIGGERED!');
+      log('🚨', '═'.repeat(70));
       
-      const cleanedResponse = formatForWhatsApp(stripCitations(response));
-      await sendFreshchatMessage(conversationId, cleanedResponse);
-      await escalateToHuman(conversationId);
+      const escalated = await escalateToHuman(conversationId);
       
-      log('✅', 'Escalation completed');
-    } else {
-      log('✅', 'No escalation - sending normal response');
-      
-      const cleanedResponse = formatForWhatsApp(stripCitations(response));
-      await sendFreshchatMessage(conversationId, cleanedResponse);
+      if (escalated) {
+        log('✅', 'Successfully escalated to human agent');
+      } else {
+        log('❌', 'Escalation failed - bot will continue');
+      }
     }
 
     log('✅', '═'.repeat(70));
@@ -790,32 +574,22 @@ async function processMessageNow(conversationId, messageContent) {
 
   } catch (error) {
     log('💥', '═'.repeat(70));
-    log('💥', `ERROR processing conversation ${conversationId}`);
-    log('💥', `Error type: ${error.message}`);
+    log('💥', `Error processing conversation ${conversationId}`);
+    log('💥', 'Error:', error.message);
+    log('💥', 'Stack:', error.stack);
     log('💥', '═'.repeat(70));
     
     try {
-      // Check if it's a timeout error
-      if (error.message.includes('timeout')) {
-        await sendFreshchatMessage(
-          conversationId,
-          "I'm taking longer than expected to process your message. " +
-          "Let me connect you with our support team who can assist you immediately. " +
-          "Thank you for your patience!"
-        );
-      } else {
-        await sendFreshchatMessage(
-          conversationId,
-          "I apologize, I'm having technical difficulty. " +
-          "Our support team is being notified and will assist you shortly. " +
-          "Thank you for your patience!"
-        );
-      }
+      await sendFreshchatMessage(
+        conversationId,
+        "I apologize, but I'm having trouble processing your request. A team member will assist you shortly."
+      );
       
-      // Escalate on error
-      await escalateToHuman(conversationId);
-    } catch (escalationError) {
-      log('❌', `Failed to escalate on error: ${escalationError.message}`);
+      if (HUMAN_AGENT_ID) {
+        await escalateToHuman(conversationId);
+      }
+    } catch (fallbackError) {
+      log('❌', 'Failed to send error message:', fallbackError.message);
     }
   }
 }
@@ -988,7 +762,7 @@ app.post('/freshchat-webhook', async (req, res) => {
     }
     
     // =====================================================
-    // Handle user messages (UPDATED with professional queue)
+    // Handle user messages
     // =====================================================
     if (action === 'message_create' && actor?.actor_type === 'user') {
       const messageConversationId = data?.message?.conversation_id;
@@ -1005,8 +779,7 @@ app.post('/freshchat-webhook', async (req, res) => {
         return;
       }
 
-      // Use NEW queue-aware handler instead of old processMessage
-      handleUserMessage(messageConversationId, messageContent)
+      processMessage(messageConversationId, messageContent)
         .catch(err => log('❌', 'Async processing error:', err.message));
       
     } else if (!isAssignmentEvent(action, data) && action !== 'message_create') {
@@ -1038,103 +811,6 @@ app.get('/debug/state', (req, res) => {
     bot_agent_id: BOT_AGENT_ID,
     human_agent_id: HUMAN_AGENT_ID
   });
-});
-
-// ============================================================
-// PROFESSIONAL ERROR HANDLING DEBUG ENDPOINTS (v11.0.0)
-// ============================================================
-
-app.get('/debug/queue-state', (req, res) => {
-  const state = {};
-  let totalLocked = 0;
-  let totalQueued = 0;
-  
-  conversationLocks.forEach((lock, conversationId) => {
-    const lockState = lock.getState();
-    state[conversationId] = lockState;
-    
-    if (lock.locked) totalLocked++;
-    if (lock.queue.length > 0) totalQueued += lock.queue.length;
-  });
-  
-  res.json({
-    summary: {
-      activeConversations: conversationLocks.size,
-      lockedConversations: totalLocked,
-      totalQueuedMessages: totalQueued,
-      averageQueueSize: conversationLocks.size > 0 
-        ? (totalQueued / conversationLocks.size).toFixed(2)
-        : 0
-    },
-    conversations: state
-  });
-});
-
-app.get('/debug/queue/:conversationId', (req, res) => {
-  const { conversationId } = req.params;
-  const state = getConversationState(conversationId);
-  
-  if (!state) {
-    return res.json({ error: 'Conversation not found' });
-  }
-  
-  res.json(state);
-});
-
-app.post('/debug/clear-all-locks', (req, res) => {
-  let cleared = 0;
-  conversationLocks.forEach((lock) => {
-    if (lock.locked) {
-      lock.unlock();
-      cleared++;
-    }
-  });
-  
-  res.json({ 
-    message: `Cleared ${cleared} locks`,
-    cleared 
-  });
-});
-
-app.post('/debug/force-unlock/:conversationId', (req, res) => {
-  const { conversationId } = req.params;
-  const state = getOrCreateState(conversationId);
-  
-  if (state.locked) {
-    state.unlock();
-    res.json({ 
-      message: `Unlocked conversation ${conversationId}`,
-      success: true 
-    });
-  } else {
-    res.json({ 
-      message: `Conversation ${conversationId} was not locked`,
-      success: false 
-    });
-  }
-});
-
-app.get('/debug/health-check', (req, res) => {
-  const stats = {
-    timestamp: new Date().toISOString(),
-    version: '11.0.0-professional-queue',
-    systemHealth: {
-      activeConversations: conversationLocks.size,
-      lockedConversations: Array.from(conversationLocks.values()).filter(s => s.locked).length,
-      allQueues: Array.from(conversationLocks.values()).map(s => ({
-        conversationId: s.conversationId,
-        locked: s.locked,
-        queueSize: s.queue.length,
-        isTimeout: s.isProcessingTimeout()
-      }))
-    },
-    botStatus: {
-      activeThreads: conversationThreads.size,
-      escalatedConversations: escalatedConversations.size
-    }
-  };
-  
-  res.json(stats);
 });
 
 // Manual force return to bot
@@ -1198,7 +874,7 @@ app.post('/test-message', async (req, res) => {
       await escalateToHuman(conversation_id);
     }
     
-    res.json({ success: true, conversation_id, escalated: needsEscalation });
+    res.json({ success: true, conversation_id, response: response.substring(0, 200) + '...', escalated: needsEscalation });
     
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -1235,7 +911,7 @@ app.get('/escalated', (req, res) => {
 app.get('/health', (req, res) => {
   res.json({ 
     status: 'healthy',
-    version: '11.0.0',
+    version: '9.1.0',
     timestamp: new Date().toISOString(),
     config: {
       freshchat_api_url: FRESHCHAT_API_URL,
@@ -1244,8 +920,7 @@ app.get('/health', (req, res) => {
     },
     stats: {
       activeThreads: conversationThreads.size,
-      escalatedConversations: escalatedConversations.size,
-      activeQueues: conversationLocks.size
+      escalatedConversations: escalatedConversations.size
     }
   });
 });
@@ -1299,21 +974,16 @@ app.get('/list-agents', async (req, res) => {
 app.get('/', (req, res) => {
   res.json({
     name: 'Freshchat-OpenAI Integration',
-    version: '11.0.0',
+    version: '9.1.0',
     status: 'running',
     important: {
-      bot_agent_id: BOT_AGENT_ID || '⚠️ NOT SET - Use /list-agents to find it!',
-      message_queue: 'Professional error handling with message queue active',
-      max_queue_size: 3,
-      processing_timeout: '30 seconds'
+      bot_agent_id: BOT_AGENT_ID || '⚠️ NOT SET - Use /list-agents to find it!'
     },
     endpoints: {
       webhook: 'POST /freshchat-webhook',
       force_return: 'POST /force-return-to-bot/:conversationId',
       debug_webhooks: 'GET /debug/webhooks',
       debug_state: 'GET /debug/state',
-      debug_queue: 'GET /debug/queue-state',
-      debug_health: 'GET /debug/health-check',
       list_agents: 'GET /list-agents'
     }
   });
@@ -1323,33 +993,15 @@ const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
   console.log('\n' + '='.repeat(70));
-  console.log('🚀 Freshchat-OpenAI Integration v11.0.0');
+  console.log('🚀 Freshchat-OpenAI Integration v9.1.0');
   console.log('='.repeat(70));
   console.log(`📍 Port: ${PORT}`);
   console.log(`🤖 Bot Agent ID: ${BOT_AGENT_ID || '⚠️ NOT SET'}`);
   console.log(`👤 Human Agent ID: ${HUMAN_AGENT_ID || '⚠️ NOT SET'}`);
   console.log('='.repeat(70));
-  console.log('📌 Professional Error Handling (v11.0.0):');
-  console.log('   ✅ Message Queue System Active');
-  console.log('   ✅ Lock-based Single Processing');
-  console.log('   ✅ Smart Escalation on Queue Full');
-  console.log('   ✅ Timeout Protection (30 seconds)');
-  console.log('   ✅ Status Updates to Users');
-  console.log('   ✅ Advanced Monitoring Endpoints');
-  console.log('='.repeat(70));
-  console.log('📌 Key Features:');
-  console.log('   • One message processes at a time');
-  console.log('   • Up to 3 messages can be queued');
-  console.log('   • 4+ messages trigger human escalation');
-  console.log('   • 30 second timeout with escalation');
-  console.log('   • User gets status updates');
-  console.log('='.repeat(70));
-  console.log('📌 Debug Endpoints:');
-  console.log('   GET /debug/queue-state - View all conversation queues');
-  console.log('   GET /debug/queue/:conversationId - View specific queue');
-  console.log('   GET /debug/health-check - Full system health');
-  console.log('   POST /debug/force-unlock/:conversationId - Emergency unlock');
+  console.log('📌 Debug endpoints:');
   console.log('   GET /debug/webhooks - View recent webhooks');
   console.log('   GET /debug/state - View escalation state');
+  console.log('   GET /list-agents - Find agent IDs');
   console.log('='.repeat(70) + '\n');
 });
