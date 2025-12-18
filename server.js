@@ -41,6 +41,11 @@ const openai = new OpenAI({
   project: process.env.OPENAI_PROJECT_ID
 });
 
+// ============================================================
+// NEW: Track in-progress message processing to prevent race conditions
+// ============================================================
+const processingMessages = new Set();
+
 // Store conversation threads
 const conversationThreads = new Map();
 
@@ -223,9 +228,17 @@ async function getConversationDetails(conversationId) {
   }
 }
 
-// Check if conversation is assigned to human agent
+// ============================================================
+// IMPROVED: Check if conversation is assigned to human agent
+// ============================================================
 async function isConversationWithHuman(conversationId) {
   try {
+    // First check: Is it in escalated list? (FASTEST)
+    if (escalatedConversations.has(conversationId)) {
+      log('🚨', `Conversation ${conversationId} is in escalated list - BLOCKING BOT RESPONSE`);
+      return true;
+    }
+
     const conversation = await getConversationDetails(conversationId);
     
     if (!conversation) {
@@ -242,6 +255,7 @@ async function isConversationWithHuman(conversationId) {
     // If assigned to human agent OR not assigned to bot, consider it "with human"
     if (assignedAgentId && assignedAgentId !== BOT_AGENT_ID) {
       log('👨‍💼', `Conversation is with human agent (${assignedAgentId})`);
+      escalatedConversations.add(conversationId); // Sync state
       return true;
     }
 
@@ -250,12 +264,6 @@ async function isConversationWithHuman(conversationId) {
       log('🔄', 'Conversation in escalated list but assigned to bot - removing from escalated');
       escalatedConversations.delete(conversationId);
       return false;
-    }
-
-    // If conversation is in escalated list
-    if (escalatedConversations.has(conversationId)) {
-      log('🚨', 'Conversation is in escalated list');
-      return true;
     }
 
     log('🤖', 'Conversation is still with bot');
@@ -267,7 +275,9 @@ async function isConversationWithHuman(conversationId) {
   }
 }
 
-// Assign conversation to human agent (ESCALATION)
+// ============================================================
+// IMPROVED: Assign conversation to human agent (ESCALATION - SILENT)
+// ============================================================
 async function escalateToHuman(conversationId) {
   try {
     if (!HUMAN_AGENT_ID) {
@@ -276,6 +286,10 @@ async function escalateToHuman(conversationId) {
     }
 
     log('🚨', `Escalating conversation ${conversationId} to human agent ${HUMAN_AGENT_ID}`);
+
+    // MARK AS ESCALATED IMMEDIATELY in memory BEFORE API call
+    escalatedConversations.add(conversationId);
+    log('✅', `Marked conversation ${conversationId} as escalated in memory`);
 
     const response = await axios.put(
       `${FRESHCHAT_API_URL}/conversations/${conversationId}`,
@@ -293,8 +307,6 @@ async function escalateToHuman(conversationId) {
 
     log('✅', `Conversation reassigned to human agent`);
     log('📋', 'Response:', response.data);
-
-    escalatedConversations.add(conversationId);
 
     conversationThreads.delete(conversationId);
     log('🗑️', `Removed thread for conversation ${conversationId}`);
@@ -489,6 +501,9 @@ async function getAssistantResponse(userMessage, threadId = null) {
     const responseText = assistantMessage.content[0].text.value;
     log('🤖', `Assistant said: ${responseText.substring(0, 200)}...`);
 
+    // ============================================================
+    // ESCALATION KEYWORDS - IMPROVED LIST
+    // ============================================================
     const escalationKeywords = [
       'Please allow me to connect you to our manager. The response may take 12 to 24 hours due to the high volume of chats. Your patience would be highly appreciated.',
       'connecting you with a Human Representative',
@@ -500,7 +515,13 @@ async function getAssistantResponse(userMessage, threadId = null) {
       'allow me to connect with Human Representative',
       'connect you to Human Representative',
       'Please allow me to connect you to our Human Representative',
-      'I have forwarded your details to our Human Representative'
+      'I have forwarded your details to our Human Representative',
+      'let me escalate',
+      'escalate your case',
+      'human representative',
+      'team member will assist',
+      'manager will contact',
+      'hand you over to'
     ];
 
     const needsEscalation = escalationKeywords.some(keyword => 
@@ -523,13 +544,24 @@ async function getAssistantResponse(userMessage, threadId = null) {
   }
 }
 
-// Process message asynchronously
+// ============================================================
+// CRITICAL FIX: Process message with SILENT escalation
+// ============================================================
 async function processMessage(conversationId, messageContent) {
+  // NEW: Prevent duplicate processing
+  if (processingMessages.has(conversationId)) {
+    log('⚠️', `Message already being processed for ${conversationId}, skipping`);
+    return;
+  }
+  
+  processingMessages.add(conversationId);
+  
   try {
     log('🔄', '═'.repeat(70));
     log('🔄', `Processing conversation: ${conversationId}`);
     log('💬', `User message: "${messageContent}"`);
 
+    // Check 1: Before processing
     const isWithHuman = await isConversationWithHuman(conversationId);
     
     if (isWithHuman) {
@@ -548,25 +580,51 @@ async function processMessage(conversationId, messageContent) {
     const { response, threadId: newThreadId, needsEscalation } = 
       await getAssistantResponse(messageContent, threadId);
 
+    // NEW: Check AGAIN if conversation was assigned to human while we were processing
+    if (await isConversationWithHuman(conversationId)) {
+      log('🛑', 'Conversation was assigned to human DURING processing!');
+      log('🛑', 'Discarding AI response and NOT sending to user');
+      return;
+    }
+
     conversationThreads.set(conversationId, newThreadId);
     log('💾', `Saved thread ${newThreadId} for conversation ${conversationId}`);
 
-    const cleanedResponse = formatForWhatsApp(stripCitations(response));
-    await sendFreshchatMessage(conversationId, cleanedResponse);
-
+    // ============================================================
+    // CRITICAL: If escalation needed, DO NOT SEND response to user
+    // Silently escalate in the background
+    // ============================================================
     if (needsEscalation) {
       log('🚨', '═'.repeat(70));
-      log('🚨', 'ESCALATION TRIGGERED!');
+      log('🚨', 'ESCALATION DETECTED - SILENT ESCALATION');
+      log('🚨', 'NOT sending bot response to user');
+      log('🚨', 'Escalating to human agent silently');
       log('🚨', '═'.repeat(70));
       
+      // Mark as escalated IMMEDIATELY
+      escalatedConversations.add(conversationId);
+      log('✅', `Conversation ${conversationId} marked as escalated in memory`);
+
+      // Escalate to human WITHOUT sending bot message
       const escalated = await escalateToHuman(conversationId);
       
       if (escalated) {
-        log('✅', 'Successfully escalated to human agent');
+        log('✅', 'Successfully escalated to human agent (silently)');
+        log('✅', 'No message was sent to the user');
       } else {
-        log('❌', 'Escalation failed - bot will continue');
+        log('❌', 'Escalation API failed - but conversation marked as escalated');
+        log('⚠️', 'Will still block bot responses, but reassignment may not have worked');
       }
+
+      return;  // Exit without sending any message
     }
+
+    // ============================================================
+    // Normal flow: Send response to user
+    // ============================================================
+    log('✅', 'No escalation needed - sending normal response');
+    const cleanedResponse = formatForWhatsApp(stripCitations(response));
+    await sendFreshchatMessage(conversationId, cleanedResponse);
 
     log('✅', '═'.repeat(70));
     log('✅', `Successfully processed conversation ${conversationId}`);
@@ -586,11 +644,15 @@ async function processMessage(conversationId, messageContent) {
       );
       
       if (HUMAN_AGENT_ID) {
+        escalatedConversations.add(conversationId);
         await escalateToHuman(conversationId);
       }
     } catch (fallbackError) {
       log('❌', 'Failed to send error message:', fallbackError.message);
     }
+  } finally {
+    // NEW: Always remove from processing set
+    processingMessages.delete(conversationId);
   }
 }
 
@@ -806,6 +868,8 @@ app.get('/debug/state', (req, res) => {
   res.json({
     escalated_conversations: Array.from(escalatedConversations),
     escalated_count: escalatedConversations.size,
+    processing_messages: Array.from(processingMessages),
+    processing_count: processingMessages.size,
     active_threads: Array.from(conversationThreads.entries()).map(([k, v]) => ({ conversation: k, thread: v })),
     thread_count: conversationThreads.size,
     bot_agent_id: BOT_AGENT_ID,
@@ -911,7 +975,7 @@ app.get('/escalated', (req, res) => {
 app.get('/health', (req, res) => {
   res.json({ 
     status: 'healthy',
-    version: '9.1.0',
+    version: '11.0.0 - Silent Escalation',
     timestamp: new Date().toISOString(),
     config: {
       freshchat_api_url: FRESHCHAT_API_URL,
@@ -920,7 +984,8 @@ app.get('/health', (req, res) => {
     },
     stats: {
       activeThreads: conversationThreads.size,
-      escalatedConversations: escalatedConversations.size
+      escalatedConversations: escalatedConversations.size,
+      processingMessages: processingMessages.size
     }
   });
 });
@@ -974,11 +1039,12 @@ app.get('/list-agents', async (req, res) => {
 app.get('/', (req, res) => {
   res.json({
     name: 'Freshchat-OpenAI Integration',
-    version: '9.1.0',
+    version: '11.0.0 - Silent Escalation',
     status: 'running',
     important: {
       bot_agent_id: BOT_AGENT_ID || '⚠️ NOT SET - Use /list-agents to find it!'
     },
+    escalation_mode: 'SILENT - Bot does not send escalation message',
     endpoints: {
       webhook: 'POST /freshchat-webhook',
       force_return: 'POST /force-return-to-bot/:conversationId',
@@ -993,11 +1059,17 @@ const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
   console.log('\n' + '='.repeat(70));
-  console.log('🚀 Freshchat-OpenAI Integration v9.1.0');
+  console.log('🚀 Freshchat-OpenAI Integration v11.0.0 - SILENT ESCALATION');
   console.log('='.repeat(70));
   console.log(`📍 Port: ${PORT}`);
   console.log(`🤖 Bot Agent ID: ${BOT_AGENT_ID || '⚠️ NOT SET'}`);
   console.log(`👤 Human Agent ID: ${HUMAN_AGENT_ID || '⚠️ NOT SET'}`);
+  console.log('='.repeat(70));
+  console.log('⚡ Key Features:');
+  console.log('   ✅ Silent escalation (no message sent)');
+  console.log('   ✅ Processing locks (prevent race conditions)');
+  console.log('   ✅ Double-check strategy');
+  console.log('   ✅ Immediate memory marking');
   console.log('='.repeat(70));
   console.log('📌 Debug endpoints:');
   console.log('   GET /debug/webhooks - View recent webhooks');
