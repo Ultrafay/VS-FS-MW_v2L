@@ -47,6 +47,10 @@ const conversationThreads = new Map();
 // Store conversations that have been escalated (bot should NOT respond)
 const escalatedConversations = new Set();
 
+// Store conversations that triggered escalation but response not yet sent
+// This prevents the bot from responding to the same message that triggered escalation
+const pendingEscalations = new Map(); // conversationId -> { threadId, needsEscalation, timestamp }
+
 // Store recent webhooks for debugging
 const recentWebhooks = [];
 const MAX_STORED_WEBHOOKS = 50;
@@ -295,6 +299,9 @@ async function escalateToHuman(conversationId) {
     log('📋', 'Response:', response.data);
 
     escalatedConversations.add(conversationId);
+    
+    // Clear pending escalation for this conversation
+    pendingEscalations.delete(conversationId);
 
     conversationThreads.delete(conversationId);
     log('🗑️', `Removed thread for conversation ${conversationId}`);
@@ -353,6 +360,7 @@ async function returnToBot(conversationId, sendWelcomeMessage = true, reassignIn
     // Remove from escalated list so bot can respond again
     const wasEscalated = escalatedConversations.has(conversationId);
     escalatedConversations.delete(conversationId);
+    pendingEscalations.delete(conversationId);
     log('✅', `Removed conversation ${conversationId} from escalated list (was escalated: ${wasEscalated})`);
 
     // Send welcome back message if enabled
@@ -530,6 +538,9 @@ async function processMessage(conversationId, messageContent) {
     log('🔄', `Processing conversation: ${conversationId}`);
     log('💬', `User message: "${messageContent}"`);
 
+    // ============================================================
+    // ENHANCED: Check if conversation is already escalated FIRST
+    // ============================================================
     const isWithHuman = await isConversationWithHuman(conversationId);
     
     if (isWithHuman) {
@@ -551,26 +562,39 @@ async function processMessage(conversationId, messageContent) {
     conversationThreads.set(conversationId, newThreadId);
     log('💾', `Saved thread ${newThreadId} for conversation ${conversationId}`);
 
-    const cleanedResponse = formatForWhatsApp(stripCitations(response));
-    await sendFreshchatMessage(conversationId, cleanedResponse);
-
+    // ============================================================
+    // CRITICAL FIX: Only send response if escalation is NOT needed
+    // If escalation keyword is detected, DON'T send the bot response
+    // Instead, go straight to escalation
+    // ============================================================
     if (needsEscalation) {
       log('🚨', '═'.repeat(70));
-      log('🚨', 'ESCALATION TRIGGERED!');
+      log('🚨', 'ESCALATION KEYWORD DETECTED!');
+      log('🚨', 'Bot will NOT send response - escalating directly to human');
       log('🚨', '═'.repeat(70));
       
       const escalated = await escalateToHuman(conversationId);
       
       if (escalated) {
         log('✅', 'Successfully escalated to human agent');
+        log('✅', 'Conversation assigned to human - bot is SILENT');
+        log('✅', '═'.repeat(70));
       } else {
-        log('❌', 'Escalation failed - bot will continue');
+        log('❌', 'Escalation failed');
+        // Still send the response even if escalation failed
+        const cleanedResponse = formatForWhatsApp(stripCitations(response));
+        await sendFreshchatMessage(conversationId, cleanedResponse);
       }
+    } else {
+      // Normal response - no escalation needed
+      log('✅', 'No escalation keyword detected - sending normal response');
+      const cleanedResponse = formatForWhatsApp(stripCitations(response));
+      await sendFreshchatMessage(conversationId, cleanedResponse);
+      
+      log('✅', '═'.repeat(70));
+      log('✅', `Successfully processed conversation ${conversationId}`);
+      log('✅', '═'.repeat(70));
     }
-
-    log('✅', '═'.repeat(70));
-    log('✅', `Successfully processed conversation ${conversationId}`);
-    log('✅', '═'.repeat(70));
 
   } catch (error) {
     log('💥', '═'.repeat(70));
@@ -806,6 +830,7 @@ app.get('/debug/state', (req, res) => {
   res.json({
     escalated_conversations: Array.from(escalatedConversations),
     escalated_count: escalatedConversations.size,
+    pending_escalations: Array.from(pendingEscalations.keys()),
     active_threads: Array.from(conversationThreads.entries()).map(([k, v]) => ({ conversation: k, thread: v })),
     thread_count: conversationThreads.size,
     bot_agent_id: BOT_AGENT_ID,
@@ -821,6 +846,7 @@ app.post('/force-return-to-bot/:conversationId', async (req, res) => {
   
   try {
     escalatedConversations.delete(conversationId);
+    pendingEscalations.delete(conversationId);
     
     if (BOT_AGENT_ID) {
       try {
@@ -867,14 +893,16 @@ app.post('/test-message', async (req, res) => {
     
     conversationThreads.set(conversation_id, newThreadId);
     
+    // If escalation is needed, don't send the response - escalate instead
+    if (needsEscalation) {
+      await escalateToHuman(conversation_id);
+      return res.json({ success: true, conversation_id, escalated: true, message: 'Escalated to human' });
+    }
+    
     const cleanedResponse = formatForWhatsApp(stripCitations(response));
     await sendFreshchatMessage(conversation_id, cleanedResponse);
     
-    if (needsEscalation) {
-      await escalateToHuman(conversation_id);
-    }
-    
-    res.json({ success: true, conversation_id, response: response.substring(0, 200) + '...', escalated: needsEscalation });
+    res.json({ success: true, conversation_id, response: response.substring(0, 200) + '...', escalated: false });
     
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -884,6 +912,7 @@ app.post('/test-message', async (req, res) => {
 app.post('/reset-escalation/:conversationId', (req, res) => {
   const { conversationId } = req.params;
   escalatedConversations.delete(conversationId);
+  pendingEscalations.delete(conversationId);
   conversationThreads.delete(conversationId);
   res.json({ success: true, message: 'Escalation reset' });
 });
@@ -904,14 +933,15 @@ app.get('/escalated', (req, res) => {
   res.json({
     escalated_conversations: Array.from(escalatedConversations),
     count: escalatedConversations.size,
-    active_threads: conversationThreads.size
+    active_threads: conversationThreads.size,
+    pending_escalations: Array.from(pendingEscalations.keys())
   });
 });
 
 app.get('/health', (req, res) => {
   res.json({ 
     status: 'healthy',
-    version: '9.1.0',
+    version: '9.2.0',
     timestamp: new Date().toISOString(),
     config: {
       freshchat_api_url: FRESHCHAT_API_URL,
@@ -920,7 +950,8 @@ app.get('/health', (req, res) => {
     },
     stats: {
       activeThreads: conversationThreads.size,
-      escalatedConversations: escalatedConversations.size
+      escalatedConversations: escalatedConversations.size,
+      pendingEscalations: pendingEscalations.size
     }
   });
 });
@@ -974,10 +1005,11 @@ app.get('/list-agents', async (req, res) => {
 app.get('/', (req, res) => {
   res.json({
     name: 'Freshchat-OpenAI Integration',
-    version: '9.1.0',
+    version: '9.2.0',
     status: 'running',
     important: {
-      bot_agent_id: BOT_AGENT_ID || '⚠️ NOT SET - Use /list-agents to find it!'
+      bot_agent_id: BOT_AGENT_ID || '⚠️ NOT SET - Use /list-agents to find it!',
+      escalation_behavior: 'When escalation keyword detected, bot will NOT send response and will escalate directly'
     },
     endpoints: {
       webhook: 'POST /freshchat-webhook',
@@ -993,11 +1025,17 @@ const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
   console.log('\n' + '='.repeat(70));
-  console.log('🚀 Freshchat-OpenAI Integration v9.1.0');
+  console.log('🚀 Freshchat-OpenAI Integration v9.2.0');
   console.log('='.repeat(70));
   console.log(`📍 Port: ${PORT}`);
   console.log(`🤖 Bot Agent ID: ${BOT_AGENT_ID || '⚠️ NOT SET'}`);
   console.log(`👤 Human Agent ID: ${HUMAN_AGENT_ID || '⚠️ NOT SET'}`);
+  console.log('='.repeat(70));
+  console.log('📌 Enhanced Escalation Behavior:');
+  console.log('   ✅ Bot checks escalation BEFORE sending response');
+  console.log('   ✅ If escalation keyword found, NO bot response is sent');
+  console.log('   ✅ Conversation immediately assigned to human agent');
+  console.log('   ✅ Bot stays silent while human agent handles conversation');
   console.log('='.repeat(70));
   console.log('📌 Debug endpoints:');
   console.log('   GET /debug/webhooks - View recent webhooks');
