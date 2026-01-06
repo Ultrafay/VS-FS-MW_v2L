@@ -579,9 +579,10 @@ async function processMessage(conversationId, messageContent) {
     log('💥', 'Stack:', error.stack);
     log('💥', '═'.repeat(70));
     
- /   // try {
-  /  //   await sendFreshchatMessage(
+ try {
+   await sendFreshchatMessage(
         conversationId,
+        "I apologize, but I'm having trouble processing your request. A team member will assist you shortly."
       );
       
       if (HUMAN_AGENT_ID) {
