@@ -21,7 +21,7 @@ console.log('='.repeat(70));
 console.log('FRESHCHAT_API_KEY:', FRESHCHAT_API_KEY ? '✅ Set' : '❌ Missing');
 console.log('FRESHCHAT_API_URL:', FRESHCHAT_API_URL);
 console.log('OPENAI_API_KEY:', OPENAI_API_KEY ? '✅ Set' : '❌ Missing');
-console.log('ASSISTANT_ID:', ASSISTANT_ID || '❌ Missing');
+console.log('ASSISTANT_ID:', ASSISTANT_ID || '�� Missing');
 console.log('BOT_AGENT_ID:', BOT_AGENT_ID || '⚠️ Not set (REQUIRED for reassignment detection)');
 console.log('HUMAN_AGENT_ID:', HUMAN_AGENT_ID || '⚠️ Not set (for escalation)');
 console.log('='.repeat(70) + '\n');
@@ -84,7 +84,7 @@ function stripCitations(text) {
     
     // OpenAI Assistant citation patterns - IMPROVED to catch ALL formats
     // Catches: 【12:0,1,2†Advanced Financial Management AFM】
-    // Catches: 【4:0†source】
+    // Catches:  
     // Catches: 【1:2:3†anything】
     /【[^】]*】/g,
     
@@ -579,17 +579,15 @@ async function processMessage(conversationId, messageContent) {
     log('💥', 'Stack:', error.stack);
     log('💥', '═'.repeat(70));
     
- try {
-   await sendFreshchatMessage(
-        conversationId,
-        "I apologize, but I'm having trouble processing your request. A team member will assist you shortly."
-      );
-      
-      if (HUMAN_AGENT_ID) {
-        await escalateToHuman(conversationId);
-      }
+   try {
+     // NOTE: Removed automatic failure message per request.
+     // Previously the bot sent a fallback message to the user here.
+     // Now we optionally escalate to a human without sending that message.
+     if (HUMAN_AGENT_ID) {
+       await escalateToHuman(conversationId);
+     }
     } catch (fallbackError) {
-      log('❌', 'Failed to send error message:', fallbackError.message);
+      log('❌', 'Failed during fallback handling:', fallbackError.message);
     }
   }
 }
