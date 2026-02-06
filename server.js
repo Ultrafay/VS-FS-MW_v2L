@@ -6,7 +6,7 @@ const OpenAI = require('openai');
 const app = express();
 app.use(express.json());
 
-// Configuration
+// Configurations
 const FRESHCHAT_API_KEY = process.env.FRESHCHAT_API_KEY;
 const FRESHCHAT_API_URL = process.env.FRESHCHAT_API_URL || 'https://api.freshchat.com/v2';
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
