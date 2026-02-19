@@ -21,7 +21,7 @@ console.log('='.repeat(70));
 console.log('FRESHCHAT_API_KEY:', FRESHCHAT_API_KEY ? '✅ Set' : '❌ Missing');
 console.log('FRESHCHAT_API_URL:', FRESHCHAT_API_URL);
 console.log('OPENAI_API_KEY:', OPENAI_API_KEY ? '✅ Set' : '❌ Missing');
-console.log('ASSISTANT_ID:', ASSISTANT_ID || '�� Missing');
+console.log('ASSISTANT_ID:', ASSISTANT_ID || '❌ Missing');
 console.log('BOT_AGENT_ID:', BOT_AGENT_ID || '⚠️ Not set (REQUIRED for reassignment detection)');
 console.log('HUMAN_AGENT_ID:', HUMAN_AGENT_ID || '⚠️ Not set (for escalation)');
 console.log('='.repeat(70) + '\n');
@@ -78,29 +78,15 @@ function stripCitations(text) {
   let cleaned = text;
 
   const inlinePatterns = [
-    // Standard footnote patterns
     /\[\^\d+\^\]/g,
     /\[\d+\]/g,
-    
-    // OpenAI Assistant citation patterns - IMPROVED to catch ALL formats
-    // Catches: 【12:0,1,2†Advanced Financial Management AFM】
-    // Catches:  
-    // Catches: 【1:2:3†anything】
     /【[^】]*】/g,
-    
-    // Source patterns
     /\(Source:[^)]+\)/gi,
     /\[Source:[^\]]+\]/gi,
-    
-    // Additional OpenAI patterns
     /\[\d+:\d+[^\]]*\]/g,
     /\(\d+:\d+[^)]*\)/g,
-    
-    // Superscript-style citations
     /\^\[\d+\]/g,
     /\[\^\d+\]/g,
-    
-    // Catch any remaining bracket citations with numbers/colons
     /\[\d+[:\d,†]*[^\]]*\]/g
   ];
 
@@ -108,19 +94,12 @@ function stripCitations(text) {
     cleaned = cleaned.replace(pattern, '');
   });
 
-  // Remove citation lines at start of line
   cleaned = cleaned.replace(/^\s*\[\^\d+\^\]:.*$/gm, '');
   cleaned = cleaned.replace(/^\s*【[^】]*】.*$/gm, '');
-  
-  // Clean up extra spaces left behind
   cleaned = cleaned.replace(/[ \t]{2,}/g, ' ');
   cleaned = cleaned.replace(/\s+\n/g, '\n');
-  
-  // Clean up multiple periods or spaces before periods
   cleaned = cleaned.replace(/\s+\./g, '.');
   cleaned = cleaned.replace(/\.{2,}/g, '.');
-  
-  // Clean up space before punctuation
   cleaned = cleaned.replace(/\s+([,;:!?])/g, '$1');
   
   return cleaned.trim();
@@ -136,64 +115,34 @@ function formatForWhatsApp(text) {
 
   let formatted = text.trim();
 
-  // Convert Markdown links [text](url) to just the URL
   formatted = formatted.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '$2');
-
-  // Remove bold
   formatted = formatted.replace(/\*\*(.*?)\*\*/g, '$1');
   formatted = formatted.replace(/\*(.*?)\*/g, '$1');
-  
-  // Remove underline/italic
   formatted = formatted.replace(/__(.*?)__/g, '$1');
   formatted = formatted.replace(/_(.*?)_/g, '$1');
-  
-  // Remove inline code
   formatted = formatted.replace(/`([^`]+)`/g, '$1');
-  
-  // Convert headers to uppercase
   formatted = formatted.replace(/^#+\s*(.*)$/gm, (_, title) => title.toUpperCase());
-  
-  // Normalize bullets to simple bullet point
   formatted = formatted.replace(/^[\u2022•▪◦-]\s*/gm, '• ');
-  
-  // ============================================================
+
   // SPACING FIXES
-  // ============================================================
-  
-  // 1. Add blank line BEFORE bullet list (if text before it)
   formatted = formatted.replace(/([^\n•])\n(•\s)/g, '$1\n\n$2');
-  
-  // 2. Keep bullets together (no extra spacing between consecutive bullets)
   formatted = formatted.replace(/(•\s[^\n]+)\n\n+(•\s)/g, '$1\n$2');
-  
-  // 3. Add blank line AFTER bullet list (before next paragraph)
   formatted = formatted.replace(/(•\s[^\n]+)\n([^•\n\s])/g, '$1\n\n$2');
-  
-  // 4. Add blank line before common question phrases
   formatted = formatted.replace(/([^\n])\n(Would you like)/g, '$1\n\n$2');
   formatted = formatted.replace(/([^\n])\n(Do you want)/g, '$1\n\n$2');
   formatted = formatted.replace(/([^\n])\n(Do you need)/g, '$1\n\n$2');
   formatted = formatted.replace(/([^\n])\n(Would you prefer)/g, '$1\n\n$2');
   formatted = formatted.replace(/([^\n])\n(May I know)/g, '$1\n\n$2');
   formatted = formatted.replace(/([^\n])\n(Please let me know)/g, '$1\n\n$2');
-  
-  // 5. Add blank line before closing/escalation statements
   formatted = formatted.replace(/([^\n])\n(I have tried my best)/g, '$1\n\n$2');
   formatted = formatted.replace(/([^\n])\n(If you want me to continue)/g, '$1\n\n$2');
   formatted = formatted.replace(/([^\n])\n(If you want me to assist)/g, '$1\n\n$2');
   formatted = formatted.replace(/([^\n])\n(If you require further)/g, '$1\n\n$2');
   formatted = formatted.replace(/([^\n])\n(Please reply with)/g, '$1\n\n$2');
-  
-  // 6. Add blank line after greeting (if followed by content)
   formatted = formatted.replace(/(Hello!?|Hi!?|Good morning!?|Good afternoon!?|Good evening!?)\s*\n([^\n])/gi, '$1\n\n$2');
-  
-  // 7. Add blank line before "For" statements that start fee/course info
   formatted = formatted.replace(/([^\n])\n(For [A-Z]{2,3} )/g, '$1\n\n$2');
-  
-  // Clean up excessive newlines (max 2 consecutive)
   formatted = formatted.replace(/\n{3,}/g, '\n\n');
   
-  // Trim each line and rejoin
   formatted = formatted
     .split('\n')
     .map(line => line.trimEnd())
@@ -223,6 +172,70 @@ async function getConversationDetails(conversationId) {
   }
 }
 
+// ============================================================
+// NEW: Auto-assign conversation to bot agent if unassigned
+// ============================================================
+async function autoAssignToBot(conversationId) {
+  try {
+    if (!BOT_AGENT_ID) {
+      log('⚠️', 'No BOT_AGENT_ID set, cannot auto-assign');
+      return false;
+    }
+
+    const conversation = await getConversationDetails(conversationId);
+    
+    if (!conversation) {
+      log('⚠️', 'Could not fetch conversation for auto-assign');
+      return false;
+    }
+
+    const assignedAgentId = conversation.assigned_agent_id;
+
+    // If already assigned to bot, skip
+    if (assignedAgentId === BOT_AGENT_ID) {
+      log('✅', 'Already assigned to bot agent, skipping auto-assign');
+      return true;
+    }
+
+    // If assigned to a human agent, don't override
+    if (assignedAgentId && assignedAgentId !== BOT_AGENT_ID) {
+      log('👤', `Already assigned to another agent: ${assignedAgentId}, skipping auto-assign`);
+      return false;
+    }
+
+    // Conversation is UNASSIGNED — assign to bot
+    log('🤖', '═'.repeat(70));
+    log('🤖', `AUTO-ASSIGNING conversation ${conversationId} to bot agent ${BOT_AGENT_ID}`);
+    log('🤖', '═'.repeat(70));
+
+    await axios.put(
+      `${FRESHCHAT_API_URL}/conversations/${conversationId}`,
+      {
+        assigned_agent_id: BOT_AGENT_ID,
+        status: 'assigned'
+      },
+      {
+        headers: {
+          'Authorization': `Bearer ${FRESHCHAT_API_KEY}`,
+          'Content-Type': 'application/json'
+        },
+        timeout: 5000
+      }
+    );
+
+    log('✅', `Conversation ${conversationId} auto-assigned to bot agent successfully`);
+    return true;
+
+  } catch (error) {
+    log('❌', 'Auto-assign failed:', {
+      status: error.response?.status,
+      data: error.response?.data,
+      message: error.message
+    });
+    return false;
+  }
+}
+
 // Check if conversation is assigned to human agent
 async function isConversationWithHuman(conversationId) {
   try {
@@ -240,25 +253,24 @@ async function isConversationWithHuman(conversationId) {
     log('👤', `Human agent ID: ${HUMAN_AGENT_ID}`);
 
     // If assigned to human agent OR not assigned to bot, consider it "with human"
+    // BUT: if unassigned (null/undefined), it's NOT with human — bot should respond
     if (assignedAgentId && assignedAgentId !== BOT_AGENT_ID) {
       log('👨‍💼', `Conversation is with human agent (${assignedAgentId})`);
       return true;
     }
 
-    // If conversation is in escalated list but assigned to bot, remove from escalated
     if (escalatedConversations.has(conversationId) && assignedAgentId === BOT_AGENT_ID) {
       log('🔄', 'Conversation in escalated list but assigned to bot - removing from escalated');
       escalatedConversations.delete(conversationId);
       return false;
     }
 
-    // If conversation is in escalated list
     if (escalatedConversations.has(conversationId)) {
       log('🚨', 'Conversation is in escalated list');
       return true;
     }
 
-    log('🤖', 'Conversation is still with bot');
+    log('🤖', 'Conversation is still with bot (or unassigned)');
     return false;
 
   } catch (error) {
@@ -295,7 +307,6 @@ async function escalateToHuman(conversationId) {
     log('📋', 'Response:', response.data);
 
     escalatedConversations.add(conversationId);
-
     conversationThreads.delete(conversationId);
     log('🗑️', `Removed thread for conversation ${conversationId}`);
 
@@ -324,7 +335,6 @@ async function returnToBot(conversationId, sendWelcomeMessage = true, reassignIn
     log('🔄', `sendWelcomeMessage: ${sendWelcomeMessage}, reassignInFreshchat: ${reassignInFreshchat}`);
     log('🔄', '═'.repeat(70));
 
-    // Only reassign in Freshchat if needed (skip if already reassigned via UI)
     if (reassignInFreshchat) {
       try {
         const response = await axios.put(
@@ -340,7 +350,6 @@ async function returnToBot(conversationId, sendWelcomeMessage = true, reassignIn
             }
           }
         );
-
         log('✅', `Conversation reassigned to bot agent via API`);
         log('📋', 'Response:', response.data);
       } catch (apiError) {
@@ -350,12 +359,10 @@ async function returnToBot(conversationId, sendWelcomeMessage = true, reassignIn
       log('✅', `Conversation already assigned to bot (via Freshchat UI)`);
     }
 
-    // Remove from escalated list so bot can respond again
     const wasEscalated = escalatedConversations.has(conversationId);
     escalatedConversations.delete(conversationId);
     log('✅', `Removed conversation ${conversationId} from escalated list (was escalated: ${wasEscalated})`);
 
-    // Send welcome back message if enabled
     if (sendWelcomeMessage) {
       try {
         await sendFreshchatMessage(
@@ -523,7 +530,9 @@ async function getAssistantResponse(userMessage, threadId = null) {
   }
 }
 
-// Process message asynchronously
+// ============================================================
+// UPDATED: Process message — now auto-assigns to bot first
+// ============================================================
 async function processMessage(conversationId, messageContent) {
   try {
     log('🔄', '═'.repeat(70));
@@ -539,6 +548,12 @@ async function processMessage(conversationId, messageContent) {
       log('🛑', '═'.repeat(70));
       return;
     }
+
+    // ============================================================
+    // NEW: Auto-assign to bot agent if conversation is unassigned
+    // This ensures the chat shows as assigned in Freshchat dashboard
+    // ============================================================
+    await autoAssignToBot(conversationId);
 
     log('🤖', 'Conversation is with bot - proceeding with AI response');
     log('🔄', '═'.repeat(70));
@@ -580,9 +595,6 @@ async function processMessage(conversationId, messageContent) {
     log('💥', '═'.repeat(70));
     
    try {
-     // NOTE: Removed automatic failure message per request.
-     // Previously the bot sent a fallback message to the user here.
-     // Now we optionally escalate to a human without sending that message.
      if (HUMAN_AGENT_ID) {
        await escalateToHuman(conversationId);
      }
@@ -608,7 +620,7 @@ function extractAssignedAgentId(data, actor) {
          data?.conversation?.assignee?.id ||
          data?.assignment?.to_agent_id ||
          data?.assignment?.assignee?.id ||
-         data?.changes?.model_changes?.assigned_agent_id?.[1] || // Freshchat change format [old, new]
+         data?.changes?.model_changes?.assigned_agent_id?.[1] ||
          null;
 }
 
@@ -622,7 +634,6 @@ function isAssignmentEvent(action, data) {
     'conversation_reassignment'
   ];
   
-  // Check if it's an assignment action OR if assignment data is present
   const hasAssignmentData = data?.assignment !== undefined ||
                             data?.conversation?.assigned_agent_id !== undefined ||
                             data?.changes?.model_changes?.assigned_agent_id !== undefined;
@@ -648,7 +659,6 @@ app.post('/freshchat-webhook', async (req, res) => {
     const conversationId = extractConversationId(data);
     const assignedAgentId = extractAssignedAgentId(data, actor);
     
-    // Also check for changes format (Freshchat sends [old_value, new_value])
     const changes = data?.changes?.model_changes;
     const newAssignedAgentId = changes?.assigned_agent_id?.[1] || assignedAgentId;
     const oldAssignedAgentId = changes?.assigned_agent_id?.[0];
@@ -684,14 +694,11 @@ app.post('/freshchat-webhook', async (req, res) => {
       log('🔄', '═'.repeat(70));
       
       if (effectiveAgentId) {
-        // Check if assigned to bot
         if (effectiveAgentId === BOT_AGENT_ID) {
           log('🤖', '═'.repeat(70));
           log('🤖', 'CONVERSATION ASSIGNED TO BOT!');
           log('🤖', '═'.repeat(70));
           
-          // Always try to return to bot (whether escalated or not)
-          // This handles both escalated and fresh assignments
           returnToBot(conversationId, true, false)
             .then(success => {
               if (success) {
@@ -909,7 +916,7 @@ app.get('/escalated', (req, res) => {
 app.get('/health', (req, res) => {
   res.json({ 
     status: 'healthy',
-    version: '9.1.0',
+    version: '9.2.0',
     timestamp: new Date().toISOString(),
     config: {
       freshchat_api_url: FRESHCHAT_API_URL,
@@ -972,8 +979,13 @@ app.get('/list-agents', async (req, res) => {
 app.get('/', (req, res) => {
   res.json({
     name: 'Freshchat-OpenAI Integration',
-    version: '9.1.0',
+    version: '9.2.0',
     status: 'running',
+    features: {
+      auto_assign: '✅ Auto-assigns unassigned conversations to bot agent',
+      escalation: '✅ Escalates to human agent on keyword detection',
+      de_escalation: '✅ Returns to bot on resolution keywords or manual reassignment'
+    },
     important: {
       bot_agent_id: BOT_AGENT_ID || '⚠️ NOT SET - Use /list-agents to find it!'
     },
@@ -991,11 +1003,12 @@ const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
   console.log('\n' + '='.repeat(70));
-  console.log('🚀 Freshchat-OpenAI Integration v9.1.0');
+  console.log('🚀 Freshchat-OpenAI Integration v9.2.0');
   console.log('='.repeat(70));
   console.log(`📍 Port: ${PORT}`);
   console.log(`🤖 Bot Agent ID: ${BOT_AGENT_ID || '⚠️ NOT SET'}`);
   console.log(`👤 Human Agent ID: ${HUMAN_AGENT_ID || '⚠️ NOT SET'}`);
+  console.log(`✨ Auto-assign: ENABLED`);
   console.log('='.repeat(70));
   console.log('📌 Debug endpoints:');
   console.log('   GET /debug/webhooks - View recent webhooks');
