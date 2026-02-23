@@ -236,7 +236,10 @@ async function autoAssignToBot(conversationId) {
   }
 }
 
-// Check if conversation is assigned to human agent
+// ============================================================
+// FIXED: Check if conversation is assigned to human agent
+// Now properly handles reopened conversations after resolution
+// ============================================================
 async function isConversationWithHuman(conversationId) {
   try {
     const conversation = await getConversationDetails(conversationId);
@@ -257,6 +260,22 @@ async function isConversationWithHuman(conversationId) {
     if (assignedAgentId && assignedAgentId !== BOT_AGENT_ID) {
       log('👨‍💼', `Conversation is with human agent (${assignedAgentId})`);
       return true;
+    }
+
+    // ============================================================
+    // FIX: If conversation is UNASSIGNED but in escalated list,
+    // it means the human agent resolved it and user reopened.
+    // Clear the escalated flag and let bot handle it.
+    // ============================================================
+    if (!assignedAgentId && escalatedConversations.has(conversationId)) {
+      log('🔄', '═'.repeat(70));
+      log('🔄', 'REOPENED CONVERSATION DETECTED');
+      log('🔄', `Conversation ${conversationId} was escalated but is now UNASSIGNED`);
+      log('🔄', 'Human agent resolved it, user sent new message');
+      log('🔄', 'Removing from escalated list - bot will respond');
+      log('🔄', '═'.repeat(70));
+      escalatedConversations.delete(conversationId);
+      return false;
     }
 
     if (escalatedConversations.has(conversationId) && assignedAgentId === BOT_AGENT_ID) {
@@ -916,7 +935,7 @@ app.get('/escalated', (req, res) => {
 app.get('/health', (req, res) => {
   res.json({ 
     status: 'healthy',
-    version: '9.2.0',
+    version: '9.3.0',
     timestamp: new Date().toISOString(),
     config: {
       freshchat_api_url: FRESHCHAT_API_URL,
@@ -979,12 +998,13 @@ app.get('/list-agents', async (req, res) => {
 app.get('/', (req, res) => {
   res.json({
     name: 'Freshchat-OpenAI Integration',
-    version: '9.2.0',
+    version: '9.3.0',
     status: 'running',
     features: {
       auto_assign: '✅ Auto-assigns unassigned conversations to bot agent',
       escalation: '✅ Escalates to human agent on keyword detection',
-      de_escalation: '✅ Returns to bot on resolution keywords or manual reassignment'
+      de_escalation: '✅ Returns to bot on resolution keywords or manual reassignment',
+      reopen_handling: '✅ Properly handles reopened conversations after human resolution'
     },
     important: {
       bot_agent_id: BOT_AGENT_ID || '⚠️ NOT SET - Use /list-agents to find it!'
@@ -1003,12 +1023,13 @@ const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
   console.log('\n' + '='.repeat(70));
-  console.log('🚀 Freshchat-OpenAI Integration v9.2.0');
+  console.log('🚀 Freshchat-OpenAI Integration v9.3.0');
   console.log('='.repeat(70));
   console.log(`📍 Port: ${PORT}`);
   console.log(`🤖 Bot Agent ID: ${BOT_AGENT_ID || '⚠️ NOT SET'}`);
   console.log(`👤 Human Agent ID: ${HUMAN_AGENT_ID || '⚠️ NOT SET'}`);
   console.log(`✨ Auto-assign: ENABLED`);
+  console.log(`🔄 Reopen handling: ENABLED`);
   console.log('='.repeat(70));
   console.log('📌 Debug endpoints:');
   console.log('   GET /debug/webhooks - View recent webhooks');
