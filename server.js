@@ -54,7 +54,9 @@ const MAX_STORED_WEBHOOKS = 50;
 // ============================================================
 // IMAGE/FILE RESPONSE MESSAGE
 // ============================================================
-const IMAGE_RESPONSE_MESSAGE = `I have received your image, but to understand it better, please describe your question in text, or reply 'Human Representative' to connect with our team.`;
+const IMAGE_RESPONSE_MESSAGE = `I received your image/file, but I'm unable to process images at the moment.
+
+Please describe your question in text, or reply "Human Representative" to connect with our team.`;
 
 function log(emoji, message, data = null) {
   const timestamp = new Date().toISOString();
@@ -879,7 +881,7 @@ app.post('/freshchat-webhook', async (req, res) => {
     }
     
     // =====================================================
-    // Handle user messages (UPDATED: with image/file detection)
+    // Handle user messages (FIXED: proper image/file handling)
     // =====================================================
     if (action === 'message_create' && actor?.actor_type === 'user') {
       const messageConversationId = data?.message?.conversation_id;
@@ -904,21 +906,21 @@ app.post('/freshchat-webhook', async (req, res) => {
       }
 
       // =====================================================
-      // NEW: Handle media messages (image/file) without LLM
+      // FIXED: Handle ANY message with media (image/file)
+      // Send predefined response regardless of text presence
+      // because LLM cannot see the image context anyway
       // =====================================================
-      if ((hasImage || hasFile) && !text) {
-        // Media only, no text - send predefined response
+      if (hasImage || hasFile) {
+        log('🖼️', `Media detected (${mediaTypes.join(', ')}), sending predefined response`);
+        if (text) {
+          log('📎', `User also sent text: "${text.substring(0, 50)}..." - ignoring since LLM cannot see image context`);
+        }
         handleMediaMessage(messageConversationId, mediaTypes)
           .catch(err => log('❌', 'Error handling media:', err.message));
         return;
       }
 
-      if ((hasImage || hasFile) && text) {
-        // Media WITH text - process the text but log the media
-        log('📎', `User sent media (${mediaTypes.join(', ')}) with text, processing text only`);
-      }
-
-      // Process text message normally
+      // Process text-only message normally
       if (text) {
         processMessage(messageConversationId, text)
           .catch(err => log('❌', 'Async processing error:', err.message));
@@ -1055,7 +1057,7 @@ app.get('/escalated', (req, res) => {
 app.get('/health', (req, res) => {
   res.json({ 
     status: 'healthy',
-    version: '9.4.0',
+    version: '9.5.0',
     timestamp: new Date().toISOString(),
     config: {
       freshchat_api_url: FRESHCHAT_API_URL,
@@ -1118,14 +1120,14 @@ app.get('/list-agents', async (req, res) => {
 app.get('/', (req, res) => {
   res.json({
     name: 'Freshchat-OpenAI Integration',
-    version: '9.4.0',
+    version: '9.5.0',
     status: 'running',
     features: {
       auto_assign: '✅ Auto-assigns unassigned conversations to bot agent',
       escalation: '✅ Escalates to human agent on keyword detection',
       de_escalation: '✅ Returns to bot on resolution keywords or manual reassignment',
       reopen_handling: '✅ Properly handles reopened conversations after human resolution',
-      media_handling: '✅ Responds to images/files with predefined message (no LLM call)'
+      media_handling: '✅ Responds to images/files (with or without text) with predefined message'
     },
     important: {
       bot_agent_id: BOT_AGENT_ID || '⚠️ NOT SET - Use /list-agents to find it!'
@@ -1144,14 +1146,14 @@ const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
   console.log('\n' + '='.repeat(70));
-  console.log('🚀 Freshchat-OpenAI Integration v9.4.0');
+  console.log('🚀 Freshchat-OpenAI Integration v9.5.0');
   console.log('='.repeat(70));
   console.log(`📍 Port: ${PORT}`);
   console.log(`🤖 Bot Agent ID: ${BOT_AGENT_ID || '⚠️ NOT SET'}`);
   console.log(`👤 Human Agent ID: ${HUMAN_AGENT_ID || '⚠️ NOT SET'}`);
   console.log(`✨ Auto-assign: ENABLED`);
   console.log(`🔄 Reopen handling: ENABLED`);
-  console.log(`🖼️ Media handling: ENABLED`);
+  console.log(`🖼️ Media handling: ENABLED (text+image treated same as image-only)`);
   console.log('='.repeat(70));
   console.log('📌 Debug endpoints:');
   console.log('   GET /debug/webhooks - View recent webhooks');
