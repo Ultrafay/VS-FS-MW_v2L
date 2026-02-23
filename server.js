@@ -54,9 +54,7 @@ const MAX_STORED_WEBHOOKS = 50;
 // ============================================================
 // IMAGE/FILE RESPONSE MESSAGE
 // ============================================================
-const IMAGE_RESPONSE_MESSAGE = `I received your image/file, but I'm unable to process images at the moment.
-
-Please describe your question in text, or reply "Human Representative" to connect with our team.`;
+const IMAGE_RESPONSE_MESSAGE = `I have received your image, but to understand it better, please describe your question in text, or reply 'Human Representative' to connect with our team.`;
 
 function log(emoji, message, data = null) {
   const timestamp = new Date().toISOString();
