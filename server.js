@@ -51,6 +51,13 @@ const escalatedConversations = new Set();
 const recentWebhooks = [];
 const MAX_STORED_WEBHOOKS = 50;
 
+// ============================================================
+// IMAGE/FILE RESPONSE MESSAGE
+// ============================================================
+const IMAGE_RESPONSE_MESSAGE = `I received your image/file, but I'm unable to process images at the moment.
+
+Please describe your question in text, or reply "Human Representative" to connect with our team.`;
+
 function log(emoji, message, data = null) {
   const timestamp = new Date().toISOString();
   console.log(`[${timestamp}] ${emoji} ${message}`);
@@ -150,6 +157,62 @@ function formatForWhatsApp(text) {
     .trim();
 
   return formatted;
+}
+
+// ============================================================
+// NEW: Extract message content and detect media types
+// ============================================================
+function extractMessageContent(messageParts) {
+  if (!messageParts || !Array.isArray(messageParts)) {
+    return { text: null, hasImage: false, hasFile: false, mediaTypes: [] };
+  }
+
+  let text = null;
+  let hasImage = false;
+  let hasFile = false;
+  const mediaTypes = [];
+
+  for (const part of messageParts) {
+    // Check for text content
+    if (part.text && part.text.content) {
+      text = part.text.content;
+    }
+    
+    // Check for image
+    if (part.image) {
+      hasImage = true;
+      mediaTypes.push('image');
+    }
+    
+    // Check for file/attachment
+    if (part.file) {
+      hasFile = true;
+      mediaTypes.push('file');
+    }
+
+    // Check for other media types Freshchat might use
+    if (part.attachment) {
+      hasFile = true;
+      mediaTypes.push('attachment');
+    }
+
+    if (part.video) {
+      hasFile = true;
+      mediaTypes.push('video');
+    }
+
+    if (part.audio) {
+      hasFile = true;
+      mediaTypes.push('audio');
+    }
+
+    if (part.sticker) {
+      hasImage = true;
+      mediaTypes.push('sticker');
+    }
+  }
+
+  return { text, hasImage, hasFile, mediaTypes };
 }
 
 // Get conversation details from Freshchat API
@@ -550,6 +613,38 @@ async function getAssistantResponse(userMessage, threadId = null) {
 }
 
 // ============================================================
+// NEW: Handle image/file messages (no LLM call)
+// ============================================================
+async function handleMediaMessage(conversationId, mediaTypes) {
+  try {
+    log('🖼️', '═'.repeat(70));
+    log('🖼️', `MEDIA MESSAGE DETECTED in conversation: ${conversationId}`);
+    log('🖼️', `Media types: ${mediaTypes.join(', ')}`);
+    log('🖼️', '═'.repeat(70));
+
+    // Check if conversation is with human
+    const isWithHuman = await isConversationWithHuman(conversationId);
+    
+    if (isWithHuman) {
+      log('🛑', 'Conversation is with human agent - bot will NOT respond to media');
+      return;
+    }
+
+    // Auto-assign to bot if unassigned
+    await autoAssignToBot(conversationId);
+
+    // Send the predefined response (no LLM call)
+    await sendFreshchatMessage(conversationId, IMAGE_RESPONSE_MESSAGE);
+
+    log('✅', `Sent media acknowledgment message to conversation ${conversationId}`);
+    log('✅', '═'.repeat(70));
+
+  } catch (error) {
+    log('❌', 'Error handling media message:', error.message);
+  }
+}
+
+// ============================================================
 // UPDATED: Process message — now auto-assigns to bot first
 // ============================================================
 async function processMessage(conversationId, messageContent) {
@@ -786,25 +881,52 @@ app.post('/freshchat-webhook', async (req, res) => {
     }
     
     // =====================================================
-    // Handle user messages
+    // Handle user messages (UPDATED: with image/file detection)
     // =====================================================
     if (action === 'message_create' && actor?.actor_type === 'user') {
       const messageConversationId = data?.message?.conversation_id;
-      const messageContent = data?.message?.message_parts?.[0]?.text?.content;
+      const messageParts = data?.message?.message_parts;
+      
+      // Extract content and detect media
+      const { text, hasImage, hasFile, mediaTypes } = extractMessageContent(messageParts);
       
       log('🔍', 'User message data:', {
         conversationId: messageConversationId,
-        messageContent: messageContent?.substring(0, 100),
+        hasText: !!text,
+        textPreview: text?.substring(0, 100),
+        hasImage,
+        hasFile,
+        mediaTypes,
         isEscalated: escalatedConversations.has(messageConversationId)
       });
       
-      if (!messageConversationId || !messageContent) {
-        log('⚠️', 'Missing conversation ID or message content');
+      if (!messageConversationId) {
+        log('⚠️', 'Missing conversation ID');
         return;
       }
 
-      processMessage(messageConversationId, messageContent)
-        .catch(err => log('❌', 'Async processing error:', err.message));
+      // =====================================================
+      // NEW: Handle media messages (image/file) without LLM
+      // =====================================================
+      if ((hasImage || hasFile) && !text) {
+        // Media only, no text - send predefined response
+        handleMediaMessage(messageConversationId, mediaTypes)
+          .catch(err => log('❌', 'Error handling media:', err.message));
+        return;
+      }
+
+      if ((hasImage || hasFile) && text) {
+        // Media WITH text - process the text but log the media
+        log('📎', `User sent media (${mediaTypes.join(', ')}) with text, processing text only`);
+      }
+
+      // Process text message normally
+      if (text) {
+        processMessage(messageConversationId, text)
+          .catch(err => log('❌', 'Async processing error:', err.message));
+      } else {
+        log('⚠️', 'No text content found in message');
+      }
       
     } else if (!isAssignmentEvent(action, data) && action !== 'message_create') {
       log('ℹ️', `Ignoring webhook: action=${action}`);
@@ -935,7 +1057,7 @@ app.get('/escalated', (req, res) => {
 app.get('/health', (req, res) => {
   res.json({ 
     status: 'healthy',
-    version: '9.3.0',
+    version: '9.4.0',
     timestamp: new Date().toISOString(),
     config: {
       freshchat_api_url: FRESHCHAT_API_URL,
@@ -998,13 +1120,14 @@ app.get('/list-agents', async (req, res) => {
 app.get('/', (req, res) => {
   res.json({
     name: 'Freshchat-OpenAI Integration',
-    version: '9.3.0',
+    version: '9.4.0',
     status: 'running',
     features: {
       auto_assign: '✅ Auto-assigns unassigned conversations to bot agent',
       escalation: '✅ Escalates to human agent on keyword detection',
       de_escalation: '✅ Returns to bot on resolution keywords or manual reassignment',
-      reopen_handling: '✅ Properly handles reopened conversations after human resolution'
+      reopen_handling: '✅ Properly handles reopened conversations after human resolution',
+      media_handling: '✅ Responds to images/files with predefined message (no LLM call)'
     },
     important: {
       bot_agent_id: BOT_AGENT_ID || '⚠️ NOT SET - Use /list-agents to find it!'
@@ -1023,13 +1146,14 @@ const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
   console.log('\n' + '='.repeat(70));
-  console.log('🚀 Freshchat-OpenAI Integration v9.3.0');
+  console.log('🚀 Freshchat-OpenAI Integration v9.4.0');
   console.log('='.repeat(70));
   console.log(`📍 Port: ${PORT}`);
   console.log(`🤖 Bot Agent ID: ${BOT_AGENT_ID || '⚠️ NOT SET'}`);
   console.log(`👤 Human Agent ID: ${HUMAN_AGENT_ID || '⚠️ NOT SET'}`);
   console.log(`✨ Auto-assign: ENABLED`);
   console.log(`🔄 Reopen handling: ENABLED`);
+  console.log(`🖼️ Media handling: ENABLED`);
   console.log('='.repeat(70));
   console.log('📌 Debug endpoints:');
   console.log('   GET /debug/webhooks - View recent webhooks');
