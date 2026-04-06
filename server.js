@@ -173,24 +173,20 @@ function extractMessageContent(messageParts) {
   const mediaTypes = [];
 
   for (const part of messageParts) {
-    // Check for text content
     if (part.text && part.text.content) {
       text = part.text.content;
     }
     
-    // Check for image
     if (part.image) {
       hasImage = true;
       mediaTypes.push('image');
     }
     
-    // Check for file/attachment
     if (part.file) {
       hasFile = true;
       mediaTypes.push('file');
     }
 
-    // Check for other media types Freshchat might use
     if (part.attachment) {
       hasFile = true;
       mediaTypes.push('attachment');
@@ -236,7 +232,8 @@ async function getConversationDetails(conversationId) {
 }
 
 // ============================================================
-// NEW: Auto-assign conversation to bot agent if unassigned
+// FIXED: Auto-assign conversation to bot agent if unassigned
+// Now checks assigned_group_id to avoid stealing from teams
 // ============================================================
 async function autoAssignToBot(conversationId) {
   try {
@@ -253,6 +250,9 @@ async function autoAssignToBot(conversationId) {
     }
 
     const assignedAgentId = conversation.assigned_agent_id;
+    const assignedGroupId = conversation.assigned_group_id;
+
+    log('🔍', `Auto-assign check — agent: ${assignedAgentId}, group: ${assignedGroupId}`);
 
     // If already assigned to bot, skip
     if (assignedAgentId === BOT_AGENT_ID) {
@@ -266,7 +266,16 @@ async function autoAssignToBot(conversationId) {
       return false;
     }
 
-    // Conversation is UNASSIGNED — assign to bot
+    // ============================================================
+    // FIX: If assigned to a GROUP (e.g. Admissions Team) but no
+    // specific agent, do NOT override — the team owns this chat
+    // ============================================================
+    if (!assignedAgentId && assignedGroupId) {
+      log('👥', `Conversation assigned to group ${assignedGroupId} (no specific agent), skipping auto-assign to bot`);
+      return false;
+    }
+
+    // Conversation is TRULY UNASSIGNED (no agent AND no group) — assign to bot
     log('🤖', '═'.repeat(70));
     log('🤖', `AUTO-ASSIGNING conversation ${conversationId} to bot agent ${BOT_AGENT_ID}`);
     log('🤖', '═'.repeat(70));
@@ -301,7 +310,7 @@ async function autoAssignToBot(conversationId) {
 
 // ============================================================
 // FIXED: Check if conversation is assigned to human agent
-// Now properly handles reopened conversations after resolution
+// Now checks assigned_group_id to recognize team-owned chats
 // ============================================================
 async function isConversationWithHuman(conversationId) {
   try {
@@ -313,27 +322,37 @@ async function isConversationWithHuman(conversationId) {
     }
 
     const assignedAgentId = conversation.assigned_agent_id;
+    const assignedGroupId = conversation.assigned_group_id;
     
-    log('🔍', `Conversation ${conversationId} assigned to agent: ${assignedAgentId}`);
+    log('🔍', `Conversation ${conversationId} — agent: ${assignedAgentId}, group: ${assignedGroupId}`);
     log('🤖', `Bot agent ID: ${BOT_AGENT_ID}`);
     log('👤', `Human agent ID: ${HUMAN_AGENT_ID}`);
 
-    // If assigned to human agent OR not assigned to bot, consider it "with human"
-    // BUT: if unassigned (null/undefined), it's NOT with human — bot should respond
+    // If assigned to human agent, it's with human
     if (assignedAgentId && assignedAgentId !== BOT_AGENT_ID) {
       log('👨‍💼', `Conversation is with human agent (${assignedAgentId})`);
       return true;
     }
 
     // ============================================================
-    // FIX: If conversation is UNASSIGNED but in escalated list,
-    // it means the human agent resolved it and user reopened.
-    // Clear the escalated flag and let bot handle it.
+    // FIX: If assigned to a GROUP (like Admissions Team) but no
+    // specific agent has claimed it, it's still human-owned.
+    // Bot should NOT take over.
     // ============================================================
-    if (!assignedAgentId && escalatedConversations.has(conversationId)) {
+    if (!assignedAgentId && assignedGroupId) {
+      log('👥', `Conversation is assigned to group ${assignedGroupId} (no specific agent) — treating as human-owned`);
+      return true;
+    }
+
+    // ============================================================
+    // FIX: If conversation is UNASSIGNED (no agent AND no group)
+    // but in escalated list, it means human agent resolved it
+    // and user reopened. Clear escalated flag, let bot handle it.
+    // ============================================================
+    if (!assignedAgentId && !assignedGroupId && escalatedConversations.has(conversationId)) {
       log('🔄', '═'.repeat(70));
       log('🔄', 'REOPENED CONVERSATION DETECTED');
-      log('🔄', `Conversation ${conversationId} was escalated but is now UNASSIGNED`);
+      log('🔄', `Conversation ${conversationId} was escalated but is now UNASSIGNED (no agent, no group)`);
       log('🔄', 'Human agent resolved it, user sent new message');
       log('🔄', 'Removing from escalated list - bot will respond');
       log('🔄', '═'.repeat(70));
@@ -352,7 +371,7 @@ async function isConversationWithHuman(conversationId) {
       return true;
     }
 
-    log('🤖', 'Conversation is still with bot (or unassigned)');
+    log('🤖', 'Conversation is still with bot (or truly unassigned)');
     return false;
 
   } catch (error) {
@@ -613,7 +632,7 @@ async function getAssistantResponse(userMessage, threadId = null) {
 }
 
 // ============================================================
-// NEW: Handle image/file messages (no LLM call)
+// Handle image/file messages (no LLM call)
 // ============================================================
 async function handleMediaMessage(conversationId, mediaTypes) {
   try {
@@ -645,7 +664,7 @@ async function handleMediaMessage(conversationId, mediaTypes) {
 }
 
 // ============================================================
-// UPDATED: Process message — now auto-assigns to bot first
+// Process message — auto-assigns to bot first (if truly unassigned)
 // ============================================================
 async function processMessage(conversationId, messageContent) {
   try {
@@ -657,16 +676,14 @@ async function processMessage(conversationId, messageContent) {
     
     if (isWithHuman) {
       log('🛑', '═'.repeat(70));
-      log('🛑', 'STOPPING: Conversation is with human agent');
+      log('🛑', 'STOPPING: Conversation is with human agent or team');
       log('🛑', 'Bot will NOT respond');
       log('🛑', '═'.repeat(70));
       return;
     }
 
-    // ============================================================
-    // NEW: Auto-assign to bot agent if conversation is unassigned
-    // This ensures the chat shows as assigned in Freshchat dashboard
-    // ============================================================
+    // Auto-assign to bot agent if conversation is truly unassigned
+    // (no agent AND no group — won't steal from teams)
     await autoAssignToBot(conversationId);
 
     log('🤖', 'Conversation is with bot - proceeding with AI response');
@@ -881,7 +898,7 @@ app.post('/freshchat-webhook', async (req, res) => {
     }
     
     // =====================================================
-    // Handle user messages (FIXED: proper image/file handling)
+    // Handle user messages (with image/file handling)
     // =====================================================
     if (action === 'message_create' && actor?.actor_type === 'user') {
       const messageConversationId = data?.message?.conversation_id;
@@ -905,11 +922,7 @@ app.post('/freshchat-webhook', async (req, res) => {
         return;
       }
 
-      // =====================================================
-      // FIXED: Handle ANY message with media (image/file)
-      // Send predefined response regardless of text presence
-      // because LLM cannot see the image context anyway
-      // =====================================================
+      // Handle ANY message with media (image/file)
       if (hasImage || hasFile) {
         log('🖼️', `Media detected (${mediaTypes.join(', ')}), sending predefined response`);
         if (text) {
@@ -1057,7 +1070,7 @@ app.get('/escalated', (req, res) => {
 app.get('/health', (req, res) => {
   res.json({ 
     status: 'healthy',
-    version: '9.5.0',
+    version: '9.6.0',
     timestamp: new Date().toISOString(),
     config: {
       freshchat_api_url: FRESHCHAT_API_URL,
@@ -1120,10 +1133,11 @@ app.get('/list-agents', async (req, res) => {
 app.get('/', (req, res) => {
   res.json({
     name: 'Freshchat-OpenAI Integration',
-    version: '9.5.0',
+    version: '9.6.0',
     status: 'running',
     features: {
-      auto_assign: '✅ Auto-assigns unassigned conversations to bot agent',
+      auto_assign: '✅ Auto-assigns truly unassigned conversations to bot agent',
+      group_respect: '✅ Respects group/team assignments — bot will NOT steal from teams',
       escalation: '✅ Escalates to human agent on keyword detection',
       de_escalation: '✅ Returns to bot on resolution keywords or manual reassignment',
       reopen_handling: '✅ Properly handles reopened conversations after human resolution',
@@ -1146,12 +1160,12 @@ const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
   console.log('\n' + '='.repeat(70));
-  console.log('🚀 Freshchat-OpenAI Integration v9.5.0');
+  console.log('🚀 Freshchat-OpenAI Integration v9.6.0');
   console.log('='.repeat(70));
   console.log(`📍 Port: ${PORT}`);
   console.log(`🤖 Bot Agent ID: ${BOT_AGENT_ID || '⚠️ NOT SET'}`);
   console.log(`👤 Human Agent ID: ${HUMAN_AGENT_ID || '⚠️ NOT SET'}`);
-  console.log(`✨ Auto-assign: ENABLED`);
+  console.log(`✨ Auto-assign: ENABLED (respects group assignments)`);
   console.log(`🔄 Reopen handling: ENABLED`);
   console.log(`🖼️ Media handling: ENABLED (text+image treated same as image-only)`);
   console.log('='.repeat(70));
