@@ -58,14 +58,6 @@ const IMAGE_RESPONSE_MESSAGE = `I received your image/file, but I'm unable to pr
 
 Please describe your question in text, or reply "Human Representative" to connect with our team.`;
 
-// ============================================================
-// RACE CONDITION FIX — Delay before checking assignment
-// This gives Freshchat's own routing rules time to complete,
-// preventing the bot from assigning itself and then being
-// immediately overridden by Freshchat's default routing.
-// ============================================================
-const ROUTING_DELAY_MS = 2500;
-
 function log(emoji, message, data = null) {
   const timestamp = new Date().toISOString();
   console.log(`[${timestamp}] ${emoji} ${message}`);
@@ -83,7 +75,7 @@ function storeWebhook(webhook) {
 }
 
 // ============================================================
-// Strip all citation formats from OpenAI responses
+// IMPROVED: Strip all citation formats from OpenAI responses
 // ============================================================
 function stripCitations(text) {
   if (!text || typeof text !== 'string') {
@@ -121,7 +113,7 @@ function stripCitations(text) {
 }
 
 // ============================================================
-// Format response for WhatsApp with better spacing
+// IMPROVED: Format response for WhatsApp with better spacing
 // ============================================================
 function formatForWhatsApp(text) {
   if (!text || typeof text !== 'string') {
@@ -168,7 +160,7 @@ function formatForWhatsApp(text) {
 }
 
 // ============================================================
-// Extract message content and detect media types
+// NEW: Extract message content and detect media types
 // ============================================================
 function extractMessageContent(messageParts) {
   if (!messageParts || !Array.isArray(messageParts)) {
@@ -240,7 +232,8 @@ async function getConversationDetails(conversationId) {
 }
 
 // ============================================================
-// Auto-assign conversation to bot agent if truly unassigned
+// FIXED: Auto-assign conversation to bot agent if unassigned
+// Now checks assigned_group_id to avoid stealing from teams
 // ============================================================
 async function autoAssignToBot(conversationId) {
   try {
@@ -273,13 +266,16 @@ async function autoAssignToBot(conversationId) {
       return false;
     }
 
-    // If assigned to a GROUP but no specific agent, do NOT override
+    // ============================================================
+    // FIX: If assigned to a GROUP (e.g. Admissions Team) but no
+    // specific agent, do NOT override — the team owns this chat
+    // ============================================================
     if (!assignedAgentId && assignedGroupId) {
       log('👥', `Conversation assigned to group ${assignedGroupId} (no specific agent), skipping auto-assign to bot`);
       return false;
     }
 
-    // Conversation is TRULY UNASSIGNED — assign to bot
+    // Conversation is TRULY UNASSIGNED (no agent AND no group) — assign to bot
     log('🤖', '═'.repeat(70));
     log('🤖', `AUTO-ASSIGNING conversation ${conversationId} to bot agent ${BOT_AGENT_ID}`);
     log('🤖', '═'.repeat(70));
@@ -313,7 +309,8 @@ async function autoAssignToBot(conversationId) {
 }
 
 // ============================================================
-// Check if conversation is assigned to human agent or team
+// FIXED: Check if conversation is assigned to human agent
+// Now checks assigned_group_id to recognize team-owned chats
 // ============================================================
 async function isConversationWithHuman(conversationId) {
   try {
@@ -337,18 +334,26 @@ async function isConversationWithHuman(conversationId) {
       return true;
     }
 
-    // If assigned to a GROUP (like Admissions Team) but no specific agent,
-    // it's still human-owned. Bot should NOT take over.
+    // ============================================================
+    // FIX: If assigned to a GROUP (like Admissions Team) but no
+    // specific agent has claimed it, it's still human-owned.
+    // Bot should NOT take over.
+    // ============================================================
     if (!assignedAgentId && assignedGroupId) {
       log('👥', `Conversation is assigned to group ${assignedGroupId} (no specific agent) — treating as human-owned`);
       return true;
     }
 
-    // If unassigned but in escalated list, user reopened after resolution
+    // ============================================================
+    // FIX: If conversation is UNASSIGNED (no agent AND no group)
+    // but in escalated list, it means human agent resolved it
+    // and user reopened. Clear escalated flag, let bot handle it.
+    // ============================================================
     if (!assignedAgentId && !assignedGroupId && escalatedConversations.has(conversationId)) {
       log('🔄', '═'.repeat(70));
       log('🔄', 'REOPENED CONVERSATION DETECTED');
-      log('🔄', `Conversation ${conversationId} was escalated but is now UNASSIGNED`);
+      log('🔄', `Conversation ${conversationId} was escalated but is now UNASSIGNED (no agent, no group)`);
+      log('🔄', 'Human agent resolved it, user sent new message');
       log('🔄', 'Removing from escalated list - bot will respond');
       log('🔄', '═'.repeat(70));
       escalatedConversations.delete(conversationId);
@@ -595,6 +600,9 @@ async function getAssistantResponse(userMessage, threadId = null) {
     const escalationKeywords = [
       'Please allow me to connect you to our manager. The response may take 12 to 24 hours due to the high volume of chats. Your patience would be highly appreciated.',
       'connecting you with a human representative',
+      'Awesome! Our team will get back to you shortly, and we can’t wait to assist you!  Thanks for your patience.',
+      'Our team will get back to you shortly',
+      'Awesome! Our team will get back to you shortly to assist you further. Due to the ACCA results, replies may take a little longer than usual. Thank you for your patience—we look forward to assisting you!',
       'connecting you to a human representative',
       'speak to my human representative',
       'talk to my human representative',
@@ -633,19 +641,15 @@ async function handleMediaMessage(conversationId, mediaTypes) {
     log('🖼️', `Media types: ${mediaTypes.join(', ')}`);
     log('🖼️', '═'.repeat(70));
 
-    // Wait for Freshchat routing rules to complete before checking assignment
-    log('⏱️', `Waiting ${ROUTING_DELAY_MS}ms for Freshchat routing rules to complete...`);
-    await new Promise(resolve => setTimeout(resolve, ROUTING_DELAY_MS));
-
-    // Check if conversation is with human (after delay)
+    // Check if conversation is with human
     const isWithHuman = await isConversationWithHuman(conversationId);
     
     if (isWithHuman) {
-      log('🛑', 'Conversation is with human agent or team - bot will NOT respond to media');
+      log('🛑', 'Conversation is with human agent - bot will NOT respond to media');
       return;
     }
 
-    // Auto-assign to bot if truly unassigned
+    // Auto-assign to bot if unassigned
     await autoAssignToBot(conversationId);
 
     // Send the predefined response (no LLM call)
@@ -660,9 +664,7 @@ async function handleMediaMessage(conversationId, mediaTypes) {
 }
 
 // ============================================================
-// Process message — now with race condition fix
-// Waits for Freshchat routing rules to complete before checking
-// assignment, preventing bot from stealing chats from teams.
+// Process message — auto-assigns to bot first (if truly unassigned)
 // ============================================================
 async function processMessage(conversationId, messageContent) {
   try {
@@ -670,16 +672,6 @@ async function processMessage(conversationId, messageContent) {
     log('🔄', `Processing conversation: ${conversationId}`);
     log('💬', `User message: "${messageContent}"`);
 
-    // ============================================================
-    // RACE CONDITION FIX
-    // Wait for Freshchat's own routing rules to apply before we
-    // check assignment. Otherwise, we may see the conversation as
-    // "unassigned" when Freshchat is about to route it to a team.
-    // ============================================================
-    log('⏱️', `Waiting ${ROUTING_DELAY_MS}ms for Freshchat routing rules to complete...`);
-    await new Promise(resolve => setTimeout(resolve, ROUTING_DELAY_MS));
-
-    // Now check assignment AFTER Freshchat has had time to route
     const isWithHuman = await isConversationWithHuman(conversationId);
     
     if (isWithHuman) {
@@ -690,22 +682,9 @@ async function processMessage(conversationId, messageContent) {
       return;
     }
 
-    // Double-check: fetch fresh conversation state before assigning
-    // This prevents a race where the group was assigned between
-    // isConversationWithHuman and autoAssignToBot
-    const freshCheck = await getConversationDetails(conversationId);
-    if (freshCheck && !freshCheck.assigned_agent_id && freshCheck.assigned_group_id) {
-      log('👥', `Group assignment detected on fresh check (group: ${freshCheck.assigned_group_id}) — aborting bot response`);
-      return;
-    }
-
     // Auto-assign to bot agent if conversation is truly unassigned
-    const assigned = await autoAssignToBot(conversationId);
-    
-    if (!assigned) {
-      log('🛑', 'Could not assign to bot (already owned by another agent/team) - skipping response');
-      return;
-    }
+    // (no agent AND no group — won't steal from teams)
+    await autoAssignToBot(conversationId);
 
     log('🤖', 'Conversation is with bot - proceeding with AI response');
     log('🔄', '═'.repeat(70));
@@ -717,24 +696,6 @@ async function processMessage(conversationId, messageContent) {
 
     conversationThreads.set(conversationId, newThreadId);
     log('💾', `Saved thread ${newThreadId} for conversation ${conversationId}`);
-
-    // Final safety check before sending: make sure conversation
-    // hasn't been reassigned while we were waiting for OpenAI
-    const preSendCheck = await getConversationDetails(conversationId);
-    if (preSendCheck) {
-      const currentAgent = preSendCheck.assigned_agent_id;
-      const currentGroup = preSendCheck.assigned_group_id;
-      
-      if (currentAgent && currentAgent !== BOT_AGENT_ID) {
-        log('🛑', `Conversation was reassigned to agent ${currentAgent} while generating response - not sending`);
-        return;
-      }
-      
-      if (!currentAgent && currentGroup) {
-        log('🛑', `Conversation was reassigned to group ${currentGroup} while generating response - not sending`);
-        return;
-      }
-    }
 
     const cleanedResponse = formatForWhatsApp(stripCitations(response));
     await sendFreshchatMessage(conversationId, cleanedResponse);
@@ -1007,8 +968,7 @@ app.get('/debug/state', (req, res) => {
     active_threads: Array.from(conversationThreads.entries()).map(([k, v]) => ({ conversation: k, thread: v })),
     thread_count: conversationThreads.size,
     bot_agent_id: BOT_AGENT_ID,
-    human_agent_id: HUMAN_AGENT_ID,
-    routing_delay_ms: ROUTING_DELAY_MS
+    human_agent_id: HUMAN_AGENT_ID
   });
 });
 
@@ -1110,13 +1070,12 @@ app.get('/escalated', (req, res) => {
 app.get('/health', (req, res) => {
   res.json({ 
     status: 'healthy',
-    version: '9.7.0',
+    version: '9.6.0',
     timestamp: new Date().toISOString(),
     config: {
       freshchat_api_url: FRESHCHAT_API_URL,
       has_bot_agent_id: !!BOT_AGENT_ID,
-      bot_agent_id: BOT_AGENT_ID || 'NOT SET',
-      routing_delay_ms: ROUTING_DELAY_MS
+      bot_agent_id: BOT_AGENT_ID || 'NOT SET'
     },
     stats: {
       activeThreads: conversationThreads.size,
@@ -1174,20 +1133,18 @@ app.get('/list-agents', async (req, res) => {
 app.get('/', (req, res) => {
   res.json({
     name: 'Freshchat-OpenAI Integration',
-    version: '9.7.0',
+    version: '9.6.0',
     status: 'running',
     features: {
       auto_assign: '✅ Auto-assigns truly unassigned conversations to bot agent',
       group_respect: '✅ Respects group/team assignments — bot will NOT steal from teams',
-      race_condition_fix: '✅ Waits for Freshchat routing rules before assigning',
       escalation: '✅ Escalates to human agent on keyword detection',
       de_escalation: '✅ Returns to bot on resolution keywords or manual reassignment',
       reopen_handling: '✅ Properly handles reopened conversations after human resolution',
-      media_handling: '✅ Responds to images/files with predefined message'
+      media_handling: '✅ Responds to images/files (with or without text) with predefined message'
     },
     important: {
-      bot_agent_id: BOT_AGENT_ID || '⚠️ NOT SET - Use /list-agents to find it!',
-      routing_delay_ms: ROUTING_DELAY_MS
+      bot_agent_id: BOT_AGENT_ID || '⚠️ NOT SET - Use /list-agents to find it!'
     },
     endpoints: {
       webhook: 'POST /freshchat-webhook',
@@ -1203,15 +1160,14 @@ const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
   console.log('\n' + '='.repeat(70));
-  console.log('🚀 Freshchat-OpenAI Integration v9.7.0');
+  console.log('🚀 Freshchat-OpenAI Integration v9.6.0');
   console.log('='.repeat(70));
   console.log(`📍 Port: ${PORT}`);
   console.log(`🤖 Bot Agent ID: ${BOT_AGENT_ID || '⚠️ NOT SET'}`);
   console.log(`👤 Human Agent ID: ${HUMAN_AGENT_ID || '⚠️ NOT SET'}`);
-  console.log(`⏱️  Routing delay: ${ROUTING_DELAY_MS}ms (race condition fix)`);
   console.log(`✨ Auto-assign: ENABLED (respects group assignments)`);
   console.log(`🔄 Reopen handling: ENABLED`);
-  console.log(`🖼️ Media handling: ENABLED`);
+  console.log(`🖼️ Media handling: ENABLED (text+image treated same as image-only)`);
   console.log('='.repeat(70));
   console.log('📌 Debug endpoints:');
   console.log('   GET /debug/webhooks - View recent webhooks');
