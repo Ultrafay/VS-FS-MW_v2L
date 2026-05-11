@@ -608,7 +608,8 @@ async function getAssistantResponse(userMessage, threadId = null) {
       'talk to my human representative',
       'allow me to connect with human representative',
       'please allow me to connect you to our human representative',
-      'i have forwarded your details to our human representative'
+      'i have forwarded your details to our human representative',
+      'A Human Representative will assist you further'
     ];
 
     const needsEscalation = escalationKeywords.some(keyword => 
